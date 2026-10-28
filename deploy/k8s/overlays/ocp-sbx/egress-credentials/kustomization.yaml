@@ -1,0 +1,14 @@
+# Egress credentials for the SBX0 control plane (SBX0.2b spec §4.3). A Component, not part of the
+# overlay: deploy/sbx/setup.sh lists it only behind SBX_EGRESS_CREDENTIALS=1, so a stack without
+# the switch renders exactly as before (no PVC, no store, no Recreate).
+#   pvc.yaml                    the file credential store's volume, 1 GiB RWO
+#   patch-control-plane.yaml    Recreate (an RWO volume cannot attach to a surge pod), the store env,
+#                               the PVC mount, and sbx-egress (the KEK and the host tokens) as a
+#                               second projected source of the /run/credentials volume
+# The NetworkPolicy and automountServiceAccountToken: false are untouched: the store is local.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - pvc.yaml
+patches:
+  - path: patch-control-plane.yaml

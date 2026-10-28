@@ -187,3 +187,50 @@ for r in moca-relay sbx-exec; do
     fail "Route/$r must be passthrough (gRPC must not cross the router TLS termination)"
 done
 pass 'the attach and exec Routes are passthrough'
+
+# Egress credentials (SBX0.2b, spec §4.3). The checked-in overlay is the OFF shape: no PVC, no store,
+# no Recreate. setup.sh adds the Component below only behind SBX_EGRESS_CREDENTIALS=1; rendered here
+# the way it does, through a kustomization of its own.
+[[ -z "$(q '.[] | select(.kind == "PersistentVolumeClaim")' -c)" ]] || fail 'the off shape renders a PVC'
+! grep -q 'SH_CREDENTIAL_STORE\|SH_CREDENTIAL_DIR\|moca-sbx-credentials\|sbx-egress' "$OUT" || fail 'the off shape mentions the credential store or sbx-egress'
+[[ "$(obj Deployment moca-control-plane | jq -r '.spec.strategy.type // "default"')" != Recreate ]] || fail 'the off shape runs the control plane as Recreate'
+pass 'egress off: no PVC, no credential store, no Recreate, no sbx-egress'
+
+ON="$(cd -P "$TMPD" && pwd)/on"
+mkdir -p "$ON"
+# kustomize takes only relative roots, so the paths are relative to $ON.
+rel() { python3 -c 'import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$1" "$ON"; }
+printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s\ncomponents:\n  - %s\n' \
+  "$(rel "$ROOT/deploy/k8s/overlays/ocp-sbx")" "$(rel "$ROOT/deploy/k8s/overlays/ocp-sbx/egress-credentials")" >"$ON/kustomization.yaml"
+kubectl kustomize "$ON" >"$OUT" || fail 'the overlay with the egress-credentials component does not render'
+KUBECONFIG=/dev/null kubectl label --local -f "$OUT" sbx-render- -o json | jq -s . >"$JSON"
+
+CP="$(obj Deployment moca-control-plane)"
+[[ -n "$CP" ]] || fail 'could not isolate the control-plane Deployment (egress on)'
+PVC="$(obj PersistentVolumeClaim moca-sbx-credentials)"
+[[ -n "$PVC" ]] || fail 'missing PersistentVolumeClaim/moca-sbx-credentials'
+[[ "$(jq -c '[.spec.accessModes, .spec.resources.requests.storage]' <<<"$PVC")" == '[["ReadWriteOnce"],"1Gi"]' ]] || fail "the PVC is not RWO 1Gi: $(jq -c .spec <<<"$PVC")"
+[[ "$(jq -r .metadata.namespace <<<"$PVC")" == moca-sbx ]] || fail 'the PVC is outside the overlay namespace'
+[[ "$(jq -r '.spec.template.spec.volumes[] | select(.persistentVolumeClaim) | .persistentVolumeClaim.claimName' <<<"$CP")" == moca-sbx-credentials ]] || fail 'the control plane does not volume the PVC'
+vol="$(jq -r '.spec.template.spec.volumes[] | select(.persistentVolumeClaim) | .name' <<<"$CP")"
+[[ "$(jq -r --arg v "$vol" '.spec.template.spec.containers[] | select(.name == "control-plane") | .volumeMounts[] | select(.name == $v) | .mountPath' <<<"$CP")" == /var/lib/moca/credentials ]] ||
+  fail 'the PVC is not mounted at /var/lib/moca/credentials'
+[[ "$(jq -r .spec.strategy.type <<<"$CP")" == Recreate && "$(jq -r '.spec.strategy.rollingUpdate // "none"' <<<"$CP")" == none ]] || fail 'the control plane is not strategy Recreate'
+[[ "$(cp_env SH_CREDENTIAL_STORE | jq -r .value)" == file ]] || fail 'SH_CREDENTIAL_STORE is not file'
+[[ "$(cp_env SH_CREDENTIAL_DIR | jq -r .value)" == /var/lib/moca/credentials ]] || fail 'SH_CREDENTIAL_DIR is not /var/lib/moca/credentials'
+[[ "$(cp_env CREDENTIALS_DIRECTORY | jq -r .value)" == /run/credentials ]] || fail 'CREDENTIALS_DIRECTORY moved'
+[[ "$(jq -r .spec.template.spec.automountServiceAccountToken <<<"$CP")" == false ]] || fail 'egress on mounts a service account token'
+# The credentials volume: still moca-mu1's two items, plus every key of sbx-egress as a file beside them.
+[[ "$(jq -c '[.spec.template.spec.volumes[] | select(.name == "credentials") | .projected.sources[] | {s: (.secret.name), k: [.secret.items[]?.key]}]' <<<"$CP")" == '[{"s":"moca-mu1","k":["SH_SESSION_TOKEN_PRIVATE_KEY","SH_JANITOR_TOKEN"]},{"s":"sbx-egress","k":[]}]' ]] ||
+  fail "the credentials volume is not moca-mu1's items plus sbx-egress: $(jq -c '.spec.template.spec.volumes[] | select(.name == "credentials")' <<<"$CP")"
+[[ "$(jq -r '.spec.template.spec.volumes[] | select(.name == "credentials") | .projected.defaultMode' <<<"$CP")" == 256 ]] || fail 'the projected credentials are not 0400'
+[[ "$(jq -r '.spec.template.spec.containers[] | select(.name == "control-plane") | .volumeMounts[] | select(.name == "credentials") | "\(.mountPath) \(.readOnly)"' <<<"$CP")" == '/run/credentials true' ]] ||
+  fail 'the credentials volume is not mounted read-only at /run/credentials'
+# SH_EGRESS_HOSTS and the TTL come from sbx-settings (setup.sh writes them); optional, so the shape without them still boots.
+[[ "$(cp_env SH_EGRESS_HOSTS | jq -r '.valueFrom.configMapKeyRef | "\(.name)/\(.key)/\(.optional)"')" == sbx-settings/SH_EGRESS_HOSTS/true ]] || fail 'SH_EGRESS_HOSTS is not an optional sbx-settings key'
+[[ "$(cp_env SH_EGRESS_CREDENTIAL_TTL_SECONDS | jq -r '.valueFrom.configMapKeyRef | "\(.name)/\(.key)/\(.optional)"')" == sbx-settings/SH_EGRESS_CREDENTIAL_TTL_SECONDS/true ]] || fail 'the TTL is not an optional sbx-settings key'
+# Nothing else changes: the NetworkPolicy is the off shape's (443 and 6379 only), still no ingress but the router's.
+cp_ports="$(obj NetworkPolicy moca-control-plane | jq -r '[.spec.egress[].ports[]?.port] | sort | map(tostring) | join(" ")')"
+[[ " $cp_ports " == *' 443 '* && " $cp_ports " == *' 6379 '* && " $cp_ports " != *' 6443 '* ]] || fail "egress on changed the control plane's egress ports: $cp_ports"
+[[ "$(obj NetworkPolicy moca-control-plane | jq -c '.spec.ingress')" == '[]' ]] || fail 'egress on opened ingress to the control plane'
+pass 'egress on: PVC (RWO 1Gi) mounted at /var/lib/moca/credentials, Recreate, store=file, sbx-egress projected beside moca-mu1, no service account token, NetworkPolicy unchanged'

@@ -1,0 +1,8 @@
+# The control plane's file credential store (SH_CREDENTIAL_STORE=file). Left in place when the switch
+# is turned off, so turning it back on finds the stored credentials again.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: moca-sbx-credentials, namespace: moca-sbx }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
