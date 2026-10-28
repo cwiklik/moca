@@ -210,6 +210,47 @@ describe('exchangeCredential: authHeader', () => {
     expect(message).toContain("kind 'api-key'");
   });
 
+  it('exchanges an Anthropic OAuth token as Bearer to api.anthropic.com in direct mode (#595)', async () => {
+    const OAT = 'sk-ant-oat01-not-real'; // notsecret
+    await seedCredential(d, 'github:1234', 'claude-pro', {
+      kind: 'oauth2-token',
+      destination: { hosts: ['api.anthropic.com'] },
+      endpoint: 'https://api.anthropic.com',
+      secret: { accessToken: OAT },
+    });
+    const res = await exchangeCredential(await sessionToken(d), d);
+    // Bearer is the default wire shape, so no authHeader is named.
+    expect(res).not.toHaveProperty('authHeader');
+    expect(res.anthropicAuthToken).toBe(OAT);
+    expect(res.anthropicBaseUrl).toBe('https://api.anthropic.com');
+  });
+
+  it('refuses an Anthropic OAuth token whose resolved endpoint is not api.anthropic.com', async () => {
+    // No endpoint on the credential and a gateway default: the subscription token would go to a
+    // host that cannot read it, which is a misdirected secret (spec §6.2), not a degraded request.
+    const OAT = 'sk-ant-oat01-not-real'; // notsecret
+    const gw = makeDeps({
+      config: { exchangeToken: 'shared-abc', defaultInferenceEndpoint: 'https://litellm.internal' }, // notsecret
+    });
+    await seedCredential(gw, 'github:1234', 'claude-pro', {
+      kind: 'oauth2-token',
+      destination: { hosts: ['api.anthropic.com'] },
+      endpoint: undefined,
+      secret: { accessToken: OAT },
+    });
+    const token = await sessionToken(gw);
+    let message = '';
+    try {
+      await exchangeCredential(token, gw);
+    } catch (e) {
+      message = (e as Error).message;
+      expect((e as { code: string }).code).toBe('credential_required');
+    }
+    expect(message).toContain("'claude-pro'");
+    expect(message).toContain('https://api.anthropic.com');
+    expect(message).not.toContain(OAT);
+  });
+
   it('lets an api-key credential with no endpoint use an api.anthropic.com default', async () => {
     const dflt = makeDeps({
       config: {

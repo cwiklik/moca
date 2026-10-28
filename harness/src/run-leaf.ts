@@ -33,6 +33,7 @@ import {
   resolveModelSelection,
   requireModel,
   applyModelGateway,
+  oauthAuthStorage,
   sumBranchUsage,
   turnLoaderInputs,
   type TurnConfig,
@@ -853,11 +854,14 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture, deps)
     const resourceLoader = new DefaultResourceLoader(loaderOptions as never);
     await resourceLoader.reload();
 
+    // An Anthropic OAuth token takes pi's own OAuth client path, not model.headers alone (#595).
+    const authStorage = oauthAuthStorage(model as { provider: string }, config);
     const { session } = await createAgentSession({
       sessionManager,
       model: model as never,
       resourceLoader,
       settingsManager,
+      ...(authStorage ? { authStorage } : {}),
     });
 
     try {
@@ -1060,11 +1064,14 @@ export const realProduceVerdict: ProduceVerdict = async (item, env, config, capt
     const resourceLoader = new DefaultResourceLoader(loaderOptions as never);
     await resourceLoader.reload();
 
+    // An Anthropic OAuth token takes pi's own OAuth client path, not model.headers alone (#595).
+    const authStorage = oauthAuthStorage(model as { provider: string }, config);
     const { session } = await createAgentSession({
       sessionManager,
       model: model as never,
       resourceLoader,
       settingsManager,
+      ...(authStorage ? { authStorage } : {}),
     });
 
     try {

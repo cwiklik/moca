@@ -66,12 +66,14 @@ function checkInferenceShape(
         `'x-api-key: {${field}}'; binding '${binding.header}: ${binding.format}' is neither`,
     );
   }
-  // pi-ai adds the OAuth beta headers only when ITS apiKey is the token, and the harness never hands
-  // it a caller's credential that way (MI1 R2), so an OAuth token here always 401s.
-  if (value.startsWith('sk-ant-oat')) {
+  // api.anthropic.com also reads OAuth tokens (#595): a Claude Pro/Max subscription token
+  // (sk-ant-oat…) travels as Authorization: Bearer with the oauth beta header, which the
+  // harness's pi client adds when the token is handed to it as its API key (run-turn.ts).
+  const oauth = value.startsWith('sk-ant-oat');
+  if (oauth && header === 'x-api-key') {
     invalid(
-      'Anthropic OAuth tokens (sk-ant-oat…) are not supported as inference credentials; ' +
-        "store an API key (sk-ant-api…) with kind 'api-key'",
+      'an Anthropic OAuth token (sk-ant-oat…) is read from Authorization: Bearer, not x-api-key: ' +
+        "store it with kind 'oauth2-token' or 'bearer'",
     );
   }
   if (value.startsWith('sk-ant-api') && header === 'authorization') {
@@ -83,7 +85,7 @@ function checkInferenceShape(
   if (endpoint) {
     const url = new URL(endpoint);
     if (url.hostname === ANTHROPIC_API_HOST) {
-      if (header === 'authorization') {
+      if (header === 'authorization' && !oauth) {
         invalid(
           `${ANTHROPIC_API_HOST} reads API keys from x-api-key, not Authorization: ` +
             "store the key with kind 'api-key'",

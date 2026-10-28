@@ -289,10 +289,12 @@ export function checkInferenceConfig(c: CpConfig): void {
         'no endpoint of its own',
     );
   }
-  if (token.startsWith('sk-ant-oat')) {
+  // An Anthropic OAuth token is a working fallback shape, but only on Bearer and only to
+  // api.anthropic.com (#595); the header check is direct-mode, so placeholder mode skips it below.
+  if (token.startsWith('sk-ant-oat') && c.operatorInferenceHeader === 'x-api-key') {
     throw new Error(
-      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), which the inference ' +
-        'path cannot send; use an API key (sk-ant-api…)',
+      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), which is read from ' +
+        'Authorization: Bearer: unset SH_OPERATOR_INFERENCE_HEADER',
     );
   }
   // Placeholder mode: the injector, not the harness, picks the upstream header (exchange.ts).
@@ -310,6 +312,14 @@ export function checkInferenceConfig(c: CpConfig): void {
       'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic API key (sk-ant-api…), but ' +
         'SH_DEFAULT_INFERENCE_ENDPOINT is not https://api.anthropic.com: set it to ' +
         'https://api.anthropic.com with SH_OPERATOR_INFERENCE_HEADER=x-api-key, or use a gateway token',
+    );
+  }
+  if (mismatch === 'oauth-token-elsewhere') {
+    throw new Error(
+      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), but ' +
+        'SH_DEFAULT_INFERENCE_ENDPOINT is not https://api.anthropic.com, which is the only host ' +
+        'that reads it: point SH_DEFAULT_INFERENCE_ENDPOINT at https://api.anthropic.com, or use ' +
+        'a gateway token',
     );
   }
 }

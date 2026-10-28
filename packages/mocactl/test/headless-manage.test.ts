@@ -400,7 +400,7 @@ describe('cmdCredentialAdd', () => {
     const opts = adding({ readStdin: async () => 'sk-ant-oat01-very-secret' });
     expect(await cmdCredentialAdd(rt, o, opts)).toBe(2);
     expect(puts).toEqual([]);
-    expect(o.stderr.join('\n')).toContain('OAuth tokens');
+    expect(o.stderr.join('\n')).toContain('Authorization');
     expect(o.stderr.join('\n')).not.toContain('very-secret');
   });
 

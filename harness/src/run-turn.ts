@@ -1,4 +1,5 @@
 import {
+  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
@@ -705,6 +706,35 @@ export function applyModelGateway<M extends { headers?: Record<string, unknown> 
 }
 
 /**
+ * The per-session auth storage for a caller credential that is an Anthropic OAuth token (#595).
+ *
+ * pi-ai's Anthropic client enables its OAuth wire shape — Authorization: Bearer plus the
+ * `anthropic-beta: oauth-2025-04-20` header and the Claude Code identity it sends for its own
+ * Claude Pro logins — only when the API key IT resolves (authStorage.getApiKey, not a header)
+ * is an sk-ant-oat token. A caller's credential normally rides model.headers, which cannot carry
+ * any of that; this hands pi the token through an IN-MEMORY AuthStorage scoped to the session's
+ * own registry instead. Nothing is persisted and nothing is written to the environment, so no
+ * caller's credential becomes process-wide (MI1 §5 R2 — the same boundary the env sentinel holds).
+ *
+ * Undefined for every other credential, which keeps today's model.headers path unchanged.
+ */
+export function oauthAuthStorage(
+  model: { provider: string },
+  config?: Pick<TurnConfig, 'upstreamCredential'>,
+): AuthStorage | undefined {
+  const credential = config?.upstreamCredential;
+  // Bearer-bound sk-ant-oat only: placeholders never reach upstream as themselves, and the control
+  // plane refuses an OAuth token on an x-api-key binding at PUT (credential-store.ts).
+  if (!credential?.value?.startsWith('sk-ant-oat')) return undefined;
+  if (credential.header === 'x-api-key') return undefined;
+  const storage = AuthStorage.inMemory();
+  // Keyed on the provider pi resolves the request key by, so a synthesized model's overridden
+  // provider name (SH_MODEL_PROVIDER) resolves the same override.
+  storage.setRuntimeApiKey(model.provider, credential.value);
+  return storage;
+}
+
+/**
  * Best-effort cumulative token usage summed off a session's loaded branch.
  * Mirrors the defensive pattern budget-voter.ts uses: pi's getSessionStats()
  * reads message.usage non-defensively and throws on this build, so we walk
@@ -1040,11 +1070,14 @@ async function executeTurnCore(
     : requireModel(provider, modelId);
   const model = applyModelGateway(baseModel, config);
 
+  // An Anthropic OAuth token takes pi's own OAuth client path, not model.headers alone (#595).
+  const authStorage = oauthAuthStorage(model, config);
   const { session } = await createAgentSession({
     sessionManager,
     model,
     resourceLoader,
     settingsManager,
+    ...(authStorage ? { authStorage } : {}),
   });
 
   // Per-session model spec §5.3: a switch to a smaller window compacts here, not after a failed request.

@@ -106,9 +106,11 @@ is validated before stdin is read.
 | `basic`        | `username=…` and `password=…`, one per line |
 
 Consumers are `inference`, `sandbox-egress` and `control-plane`. `basic` is not for inference; use it
-with `--consumer sandbox-egress`. For the `inference` consumer, Anthropic `sk-ant-oat…` OAuth tokens are
-rejected, as is an `sk-ant-api…` key under a bearer kind (`bearer` or `oauth2-token`), and an
-`api.anthropic.com` endpoint with a bearer kind is rejected before stdin is read.
+with `--consumer sandbox-egress`. For the `inference` consumer, an Anthropic `sk-ant-api…` key under
+a bearer kind (`bearer` or `oauth2-token`) is rejected, as is an `api.anthropic.com` endpoint with a
+bearer kind holding anything but an Anthropic OAuth token. A Claude Pro/Max `sk-ant-oat…` OAuth token
+works with kind `oauth2-token` (or `bearer`) and endpoint `https://api.anthropic.com` — and only
+there: aimed at a gateway it is rejected before stdin is read.
 
 ### `spawn`, `subagents`, `get`
 

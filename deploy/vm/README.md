@@ -322,7 +322,8 @@ The control plane refuses to boot on a fallback that cannot work, naming the set
 - no token;
 - no default endpoint;
 - an Anthropic key on the Bearer header, or aimed at anything but `https://api.anthropic.com`;
-- an `sk-ant-oat…` OAuth token.
+- an `sk-ant-oat…` OAuth token on the `x-api-key` header, or aimed at anything but
+  `https://api.anthropic.com` (the only host that reads it; on Bearer to that host it works).
 
 `journalctl -u sh-control-plane` shows which. `setup-vm.sh` itself stops on:
 
