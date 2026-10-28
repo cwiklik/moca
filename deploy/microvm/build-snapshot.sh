@@ -124,12 +124,13 @@ INSTANCE_TYPE=""
 VMM="firecracker"
 GUEST_RAM_MB=256
 OUT=""
+EGRESS_CA=""
 
 usage() {
   cat >&2 <<'USAGE'
 build-snapshot.sh --kernel PATH --rootfs PATH --agent PATH --image NAME
                   [--instance-type TYPE] [--vmm firecracker|cloud-hypervisor]
-                  [--guest-ram-mb 256] [--out DIR]
+                  [--guest-ram-mb 256] [--out DIR] [--egress-ca PATH]
 
 Builds one golden snapshot, ON THE INSTANCE TYPE THAT WILL RUN IT (spec §2.4:
 restore requires identical hardware and software). --instance-type is an OVERRIDE:
@@ -138,7 +139,11 @@ then /sys/class/dmi/id/product_name -- see detect_host_instance_type) using the
 SAME precedence remote-worker/cmd/microvm-worker/main.go's detectHostInstanceType
 uses to verify the snapshot at start, so builder and verifier agree by
 construction. Only pass --instance-type when you deliberately want the manifest to
-name something other than what this host reports. Writes vmstate, memfile and a
+name something other than what this host reports.
+
+--egress-ca PATH bakes the KVM host's TLS-interception CA (the PUBLIC certificate
+only; a file holding any PRIVATE KEY block is refused) into the rootfs trust store,
+and records "egress_ca_sha256" (sha256 of the DER) in manifest.json, outside "hash". Writes vmstate, memfile and a
 manifest.json the worker verifies at start, then restores one VM to prove the
 artifact works.
 USAGE
@@ -179,6 +184,10 @@ while [ $# -gt 0 ]; do
       OUT="${2:-}"
       shift 2
       ;;
+    --egress-ca)
+      EGRESS_CA="${2:-}"
+      shift 2
+      ;;
     -h | --help)
       usage
       ;;
@@ -187,6 +196,27 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# --egress-ca takes a PUBLIC certificate. The check runs here, before $STAGE exists, so a
+# refused file leaves nothing behind. The key-block guard comes first and is a plain grep:
+# it must hold even if openssl would happily parse the certificate half of a cert+key bundle.
+validate_egress_ca() {
+  if [ ! -f "$EGRESS_CA" ]; then
+    echo "build-snapshot.sh: --egress-ca: $EGRESS_CA is not a file" >&2
+    exit 2
+  fi
+  if grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$EGRESS_CA"; then
+    echo "build-snapshot.sh: --egress-ca: $EGRESS_CA contains a PRIVATE KEY block; pass the public certificate only" >&2
+    exit 2
+  fi
+  if ! openssl x509 -in "$EGRESS_CA" -noout >/dev/null 2>&1; then
+    echo "build-snapshot.sh: --egress-ca: $EGRESS_CA is not a parseable X.509 certificate" >&2
+    exit 2
+  fi
+}
+if [ -n "$EGRESS_CA" ]; then
+  validate_egress_ca
+fi
 
 if [ -z "$KERNEL" ] || [ -z "$ROOTFS" ] || [ -z "$AGENT_SRC" ] || [ -z "$IMAGE" ]; then
   # Fix-round-2 item C: --instance-type is deliberately NOT required here -- it is
@@ -508,6 +538,40 @@ build_agent() {
 # ---------------------------------------------------------------------------
 # 3. assemble_rootfs
 # ---------------------------------------------------------------------------
+# Bakes the host's interception CA (public cert) into the STAGED tree using the tree's own
+# trust-store tool, then points the runtimes that ignore the system store at it via init.
+install_egress_ca() {
+  local ca_guest bundle
+  if [ -x "$STAGE/rootfs-tree/usr/sbin/update-ca-certificates" ]; then
+    ca_guest=/usr/local/share/ca-certificates/moca-egress.crt
+    bundle=/etc/ssl/certs/ca-certificates.crt
+    mkdir -p "$STAGE/rootfs-tree/usr/local/share/ca-certificates"
+    cp "$EGRESS_CA" "$STAGE/rootfs-tree$ca_guest"
+    chroot "$STAGE/rootfs-tree" /usr/sbin/update-ca-certificates
+  elif [ -x "$STAGE/rootfs-tree/usr/bin/update-ca-trust" ]; then
+    ca_guest=/etc/pki/ca-trust/source/anchors/moca-egress.crt
+    bundle=/etc/pki/tls/certs/ca-bundle.crt
+    mkdir -p "$STAGE/rootfs-tree/etc/pki/ca-trust/source/anchors"
+    cp "$EGRESS_CA" "$STAGE/rootfs-tree$ca_guest"
+    chroot "$STAGE/rootfs-tree" /usr/bin/update-ca-trust extract
+  else
+    echo "build-snapshot.sh: --egress-ca: the rootfs has neither update-ca-certificates nor update-ca-trust" >&2
+    exit 1
+  fi
+  local init="$STAGE/rootfs-tree/sbin/init" tmp="$STAGE/init.egress"
+  awk -v ca="$ca_guest" -v b="$bundle" '
+    { print }
+    $0 == "export GITHUB_TOKEN=moca-placeholder" {
+      print "export NODE_EXTRA_CA_CERTS=" ca
+      print "export SSL_CERT_FILE=" b
+      print "export REQUESTS_CA_BUNDLE=" b
+    }' "$init" >"$tmp"
+  chmod 0755 "$init"
+  cat "$tmp" >"$init"
+  chmod 0555 "$init"
+  rm -f "$tmp"
+}
+
 assemble_rootfs() {
   log "assembling the rootfs from $ROOTFS"
   rm -rf "$STAGE/rootfs-tree"
@@ -551,9 +615,9 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # inherits the agent's env, which is init's env; there is no per-Exec env), so the proxy
 # settings point at the agent's in-guest listener, which relays over vsock to the
 # host-side moca-egress. GH_TOKEN/GITHUB_TOKEN are an INERT placeholder (D7): they only
-# make clients attempt auth. Nothing swaps them yet; moca-egress will swap in the real
-# credential on the host from MI1 S2. No secret is ever baked here, and the placeholder
-# matches no credential pattern.
+# make clients attempt auth. moca-egress swaps it on the host when the sandbox owner has
+# a credential for the destination (SBX0.2b). No secret is ever baked here, and the
+# placeholder matches no credential pattern.
 export HTTPS_PROXY=http://127.0.0.1:3128
 export https_proxy=http://127.0.0.1:3128
 export HTTP_PROXY=http://127.0.0.1:3128
@@ -583,7 +647,8 @@ INIT
   chmod 0555 "$STAGE/rootfs-tree/sbin/init"
 
   # P4.1 egress: git over the proxy needs a credential to attempt. It is an inert
-  # placeholder; nothing replaces it until MI1 S2, when moca-egress will on the host. The rootfs is mounted read-only, so this must land in the STAGED tree
+  # placeholder; moca-egress swaps it on the host when the sandbox owner has a credential
+  # for the destination (SBX0.2b). The rootfs is mounted read-only, so this must land in the STAGED tree
   # (not the host's /etc) before mkfs. Appended, because the image may already carry an
   # /etc/gitconfig (the identity, see check_git_identity); the leading newline guards a
   # file that lacks a trailing one.
@@ -593,6 +658,8 @@ INIT
 [credential]
 	helper = "!f() { echo username=x-access-token; echo password=moca-placeholder; }; f"
 GITCONFIG
+
+  [ -n "$EGRESS_CA" ] && install_egress_ca
 
   # A single ext4 image is what the VMM's block device backend wants; building it
   # here (rather than shipping a directory tree) is also what makes the "rootfs"
@@ -1694,7 +1761,7 @@ write_manifest() {
   # boots -- both now need it in place at the jail-relative name "/kernel"
   # pre-boot, not just afterwards for hashing.
 
-  local khash rhash ahash hash caps_json built_at
+  local khash rhash ahash hash caps_json built_at egress_json
   khash="sha256:$(sha256sum "$STAGE/kernel" | cut -d' ' -f1)"
   rhash="sha256:$(sha256sum "$STAGE/rootfs" | cut -d' ' -f1)"
   ahash="sha256:$(sha256sum "$STAGE/agent" | cut -d' ' -f1)"
@@ -1705,6 +1772,15 @@ write_manifest() {
 
   caps_json="$(printf '%s\n' "${MANIFEST_CAPABILITIES:-}" | sed '/^$/d' | awk '{printf "%s\"%s\"", sep, $0; sep=","}')"
   built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Only with --egress-ca, and AFTER "hash": the fingerprint is outside the hash (it is not one
+  # of vmpool.Manifest.ComputeHash's inputs) so a worker that predates it still verifies.
+  # DER, not PEM, so it is independent of the file's encoding and line wrapping.
+  egress_json=""
+  if [ -n "$EGRESS_CA" ]; then
+    egress_json=",
+  \"egress_ca_sha256\": \"sha256:$(openssl x509 -in "$EGRESS_CA" -outform DER | sha256sum | cut -d' ' -f1)\""
+  fi
 
   cat >"$STAGE/manifest.json" <<MANIFEST
 {
@@ -1718,7 +1794,7 @@ write_manifest() {
   "kernel_sha256": "$khash",
   "rootfs_sha256": "$rhash",
   "agent_sha256": "$ahash",
-  "hash": "$hash"
+  "hash": "$hash"$egress_json
 }
 MANIFEST
 }
