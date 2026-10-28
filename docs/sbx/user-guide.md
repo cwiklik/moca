@@ -10,10 +10,10 @@ need no MOCA background. The design is
 
 ## 1. What you get
 
-Your coding agent (Claude Code, OpenCode or Codex) still runs on your laptop, but **every command
-it runs runs in the sandbox service**, each one in a fresh virtual machine (VM). It reads, edits
-and tests your code there, in a copy of your repository at `/workspace`. **Your laptop's tree is
-untouched** until you take the agent's work back as a patch and apply it
+Your coding agent (Claude Code, OpenCode, Codex or IBM Bob) still runs on your laptop, but **every
+command it runs runs in the sandbox service**, each one in a fresh virtual machine (VM). It reads,
+edits and tests your code there, in a copy of your repository at `/workspace`. **Your laptop's tree
+is untouched** until you take the agent's work back as a patch and apply it
 (`mocactl sbx pull --apply`).
 
 Why this is safer than letting the agent run on your laptop:
@@ -76,7 +76,7 @@ mocactl sbx up
 sbx: not pushed, as they may hold secrets (--include-secrets pushes them): .env
 created sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default)
 pushed 214 files (3.2 MiB) to sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a
-configured Claude Code and OpenCode: .mcp.json, .claude/settings.json, opencode.json, CLAUDE.md, AGENTS.md
+configured Claude Code, OpenCode and IBM Bob: .mcp.json, .claude/settings.json, opencode.json, .bob/settings.json, CLAUDE.md, AGENTS.md
 sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a
 sandbox sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default), expires 2026-10-26T09:00:00.000Z; bound in .sbx/sandbox.json
 ```
@@ -213,6 +213,37 @@ model's choice rather than a guarantee, so unlike Claude Code and OpenCode there
 behind it. Codex's own sandbox is the protection that remains: add `-c sandbox_mode="read-only"`
 if you want its filesystem confinement as well.
 
+### IBM Bob
+
+Install Bob-Shell per [its install guide](https://bob.ibm.com/docs/ide/getting-started/install),
+then start it in the repository as you would the others:
+
+```bash
+bob                                               # interactive
+bob "Fix the failing test and run the suite"      # one-shot
+```
+
+**`up` configures it for you**, unlike Codex: Bob reads `.bob/settings.json` from the repository
+(`bob mcp add` writes project scope by default), so `up` merges the `sandbox` server into it with
+the other files. `bob mcp list` shows it:
+
+```
+Configured MCP servers:
+
+✓ sandbox: mocactl sbx mcp (stdio) - Connected
+```
+
+(`✗ … - Disconnected` there means Bob could not start the server: check that `mocactl` is on your
+`PATH`.)
+
+**Bob's local tools are not denied.** It has no equivalent of Claude Code's `permissions.deny`:
+`--allowed-tools` only waives the confirmation prompt, it does not take a tool away, so Bob can
+still read and write your laptop's files if the model asks it to. Nothing `up` writes can change
+that. What you have instead is Bob's own confirmation: leave the default approval mode on, so each
+tool call is shown before it runs, and prefer `bob -s` (its own sandbox) for unattended work.
+**`--yolo` and `--approval-mode yolo` auto-approve everything** — do not combine them with a
+sandbox you care about.
+
 **Take the work back** when the agent is done:
 
 ```bash
@@ -250,6 +281,7 @@ file and key.
 | `.mcp.json`              | `mcpServers.sandbox`: `mocactl sbx mcp`, the sandbox's tools over stdio                                                                                                                                                                  |
 | `.claude/settings.json`  | `permissions.allow`: `mcp__sandbox__*`; `permissions.deny`: Claude Code's local tools (`Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `NotebookEdit`, `WebFetch`, `WebSearch`, `Agent`, `Task`, …); `enabledMcpjsonServers`: `sandbox` |
 | `opencode.json`          | `mcp.sandbox`: `mocactl sbx mcp`; `tools.<name>: false` for OpenCode's local tools (`bash`, `read`, `edit`, `write`, `patch`, `apply_patch`, `glob`, `grep`, `list`, `lsp`, `webfetch`, `websearch`, `task`, `multiedit`)                |
+| `.bob/settings.json`     | `mcpServers.sandbox`: `mocactl sbx mcp`, the same entry `.mcp.json` gets. Bob has no deny list, so its local tools are **not** denied (below)                                                                                            |
 | `CLAUDE.md`, `AGENTS.md` | A block between `<!-- sbx:begin -->` and `<!-- sbx:end -->` telling the agent how the sandbox works (below)                                                                                                                              |
 | `.sbx/`                  | `sandbox.json`, the binding (your sandbox's id and the service URL), and `agent-config.json`, the record of what `up` added. `.sbx/` is listed in `.git/info/exclude`, never in your `.gitignore`                                        |
 
@@ -570,6 +602,11 @@ Other messages:
 - **Codex says it has no credentials** (`✗ auth no Codex credentials were found`): that is Codex's
   own account, not your sandbox login — `codex login`, or set `OPENAI_API_KEY`.
   `codex doctor | grep -A3 "auth "` names which one it found.
+- **Bob is not using the sandbox tools**: `bob mcp list` should show `sandbox` as `Connected`. If
+  it is missing, run `mocactl sbx up` again (`mocactl sbx doctor` checks `.bob/settings.json` too);
+  if it is `Disconnected`, `mocactl` is not on Bob's `PATH`. Note Bob's local tools are never
+  denied, so it can still act on your laptop when the model asks — see
+  [IBM Bob](#ibm-bob) above.
 - **Codex edits files on your laptop instead of in the sandbox**: check you started it with
   `mocactl sbx codex` (or the `-c mcp_servers.sandbox=…` line), and that `/mcp` in the TUI lists
   the `sandbox` tools. Note `mocactl sbx doctor`'s `agent config` check covers Claude Code and

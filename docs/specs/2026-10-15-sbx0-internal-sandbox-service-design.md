@@ -512,6 +512,12 @@ Every curated template ships `tar` and `git` (§8.2).
   and `tools` set to `false` for `bash`, `read`, `edit`, `write`, `patch`, `apply_patch`
   (`patch`'s newer name), `glob`, `grep`, `list`, `lsp`, `webfetch`, `websearch`, `task`, and
   older versions' `multiedit`.
+- **IBM Bob:** `.bob/settings.json` (its project scope, which `bob mcp add` writes by default) gets
+  `mcpServers.sandbox = { "command": "mocactl", "args": ["sbx", "mcp"] }`, the same entry
+  `.mcp.json` holds. **No tool list:** Bob has no equivalent of Claude Code's `permissions.deny` —
+  `--allowed-tools` waives the confirmation prompt rather than removing a tool — so its local
+  tools stay available and `sbx up` cannot deny them. `sbx doctor` therefore checks only that the
+  server is there. Bob's own approval mode is the remaining protection.
 - **`CLAUDE.md` and `AGENTS.md`:** a block between `<!-- sbx:begin -->` and `<!-- sbx:end -->`
   holding the MCP server's own instructions (§6.4), which state that:
   - the code lives in a remote sandbox at `/workspace`;

@@ -135,9 +135,20 @@ export const OPENCODE_SERVER = Object.freeze({
   enabled: true,
 });
 export const CLAUDE_ALLOW = 'mcp__sandbox__*';
+/**
+ * IBM Bob's server, in its project-scoped settings. The shape is `.mcp.json`'s, but kept apart from
+ * CLAUDE_SERVER so the two can diverge and a conflict can name Bob.
+ *
+ * Bob reads `.bob/settings.json` from the repository (`bob mcp add` defaults to `-s project`), so
+ * unlike Codex it needs no launcher: `up` merges into it like the other two. What it has no
+ * equivalent of is Claude Code's `permissions.deny` — `--allowed-tools` only waives confirmation,
+ * so Bob's local tools stay available and nothing here can take them away (#593's lesson, applied).
+ */
+export const BOB_SERVER = Object.freeze({ command: 'mocactl', args: ['sbx', 'mcp'] });
 
 const MCP_JSON = '.mcp.json';
 const SETTINGS = '.claude/settings.json';
+const BOB_SETTINGS = '.bob/settings.json';
 const SETTINGS_LOCAL = '.claude/settings.local.json';
 const MANIFEST = '.sbx/agent-config.json';
 const WRITE_HINT = 'edit it by hand, or run mocactl sbx up --no-agent-config';
@@ -209,6 +220,18 @@ function isClaudeServer(v: unknown): boolean {
     isObj(v) &&
     v.command === CLAUDE_SERVER.command &&
     same(v.args, CLAUDE_SERVER.args) &&
+    (v.type === undefined || v.type === 'stdio') &&
+    emptyOrNone(v.env) &&
+    onlyKeys(v, ['command', 'args', 'type', 'env'])
+  );
+}
+
+/** `mocactl sbx mcp` as IBM Bob's server: `.mcp.json`'s shape, plus Bob's own optional keys. */
+function isBobServer(v: unknown): boolean {
+  return (
+    isObj(v) &&
+    v.command === BOB_SERVER.command &&
+    same(v.args, BOB_SERVER.args) &&
     (v.type === undefined || v.type === 'stdio') &&
     emptyOrNone(v.env) &&
     onlyKeys(v, ['command', 'args', 'type', 'env'])
@@ -836,9 +859,9 @@ function loadManifest(root: string): { m?: Manifest; bad?: string } {
 }
 
 /** The JSON and Markdown files `sbx up` writes, and the directory it may create. */
-const JSON_FILES = [MCP_JSON, SETTINGS, 'opencode.json', 'opencode.jsonc'];
+const JSON_FILES = [MCP_JSON, SETTINGS, 'opencode.json', 'opencode.jsonc', BOB_SETTINGS];
 const MD_FILES = ['CLAUDE.md', 'AGENTS.md'];
-const DIRS = [dirname(SETTINGS)];
+const DIRS = [dirname(SETTINGS), dirname(BOB_SETTINGS)];
 
 /**
  * The files a record may name: the ones `sbx up` writes, and where each of them leads now if it
@@ -962,12 +985,19 @@ export function writeAgentConfig(
   const mcp = loadDoc(root, MCP_JSON, false);
   const settings = loadDoc(root, SETTINGS, false);
   const oc = loadDoc(root, opencodeFile(root), true);
+  const bob = loadDoc(root, BOB_SETTINGS, false);
   const local = readLocalSettings(root);
 
   needObjects(mcp, ['mcpServers']);
   const have = at(mcp.data, ['mcpServers', SERVER]);
   if (have !== undefined && !isClaudeServer(have)) {
     throw new ConfigConflict(mcp.rel, `mcpServers.${SERVER}`, 'is there and names another server');
+  }
+
+  needObjects(bob, ['mcpServers']);
+  const bobHave = at(bob.data, ['mcpServers', SERVER]);
+  if (bobHave !== undefined && !isBobServer(bobHave)) {
+    throw new ConfigConflict(bob.rel, `mcpServers.${SERVER}`, 'is there and names another server');
   }
 
   needObjects(settings, ['permissions']);
@@ -1035,6 +1065,7 @@ export function writeAgentConfig(
 
   // Then merge, in memory.
   if (have === undefined) setKey(mcp, ['mcpServers', SERVER], { ...CLAUDE_SERVER }, recs);
+  if (bobHave === undefined) setKey(bob, ['mcpServers', SERVER], { ...BOB_SERVER }, recs);
   addItems(
     settings,
     ['permissions', 'allow'],
@@ -1077,7 +1108,7 @@ export function writeAgentConfig(
   }
 
   const writes: { t: Target; body: string }[] = [];
-  for (const d of [mcp, settings, oc]) {
+  for (const d of [mcp, settings, oc, bob]) {
     const body = finalText(d);
     if (d.exists && body === d.original) continue;
     if (!d.exists && !recs.some((r) => r.file === d.rel)) continue;
@@ -1089,8 +1120,10 @@ export function writeAgentConfig(
     writes.push({ t: p.t, body: p.after });
     if (!p.t.exists) created.push(p.t.rel);
   }
-  if (!settings.exists && writes.some((w) => w.t.rel === settings.rel)) {
-    const dir = dirname(SETTINGS);
+  // The nested files' directories, so `sbx rm` can remove one it created.
+  for (const d of [settings, bob]) {
+    if (d.exists || !writes.some((w) => w.t.rel === d.rel)) continue;
+    const dir = dirname(d.rel);
     if (!existsSync(join(root, dir))) dirs.push(dir);
   }
   const changed = writes.map((w) => w.t.rel);
@@ -1174,7 +1207,7 @@ export function takeBackAgentConfig(root: string): TakeBack {
   // A record names a file after following links (target()), so a linked opencode.json is recorded
   // as its target's path. Only Claude Code's two files are strict JSON: decide by resolving them.
   const strict = new Set<string>();
-  for (const f of [MCP_JSON, SETTINGS]) {
+  for (const f of [MCP_JSON, SETTINGS, BOB_SETTINGS]) {
     try {
       strict.add(target(root, f, RM_HINT).rel);
     } catch {
@@ -1309,6 +1342,7 @@ export function checkAgentConfig(root: string): string[] {
   const mcp = load(MCP_JSON, false);
   const settings = load(SETTINGS, false);
   const oc = load(ocFile, true);
+  const bob = load(BOB_SETTINGS, false);
   const local = readLocalSettings(root);
 
   if (!isClaudeServer(at(mcp, ['mcpServers', SERVER]))) {
@@ -1368,6 +1402,10 @@ export function checkAgentConfig(root: string): string[] {
   const back = opencodeReenables(oc);
   if (back.length) {
     problems.push(`OpenCode: ${ocFile} re-enables local built-in tools: ${back.join(', ')}`);
+  }
+  // Bob only: it has no deny list to check, so there is no local-tools line for it.
+  if (!isBobServer(at(bob, ['mcpServers', SERVER]))) {
+    problems.push(`IBM Bob: ${BOB_SETTINGS} has no ${SERVER} MCP server (mocactl sbx mcp)`);
   }
   const seen = new Set<string>();
   for (const f of ['CLAUDE.md', 'AGENTS.md']) {
