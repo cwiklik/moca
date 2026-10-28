@@ -110,6 +110,20 @@ sandbox token (§1.1), and every attach its worker's relay token.
 | Tokens never enter the guest                                                 | The relay forwards `ExecRequest {sandbox_id, exec}` only (`proto/sandbox/v1/sandbox.proto`: `Exec` has no token field), and the worker never receives the caller's metadata; unchanged by SBX0                                                                                                                                                                                                                             | By construction                                                                                                                                                                 |
 | Access ends at expiry (30 s leeway), and within one token lifetime of delete | `packages/control-plane/test/sandbox-handlers.test.ts` "refuses to mint once deleted (with the reason) or expired…"; `packages/control-plane/test/sandbox-token.test.ts` "caps exp at the sandbox expiry, and refuses to mint for an ended sandbox", "accepts 30 s of clock skew past exp, and no more"; the relay's leeway and expiry cancel (§1.1). One token lifetime is `SBX_TOKEN_TTL_MINUTES`, 15 minutes by default | Tested; deployed: verified live 2026-10-20 (§4; smoke step 4, green in the full run)                                                                                            |
 
+### 2.1 Egress credentials (SBX0.2b, [spec](../specs/2026-10-26-sbx-egress-credentials-design.md))
+
+Rows for the user-scoped credential injection. The live rows are **open**: the live acceptance
+(plan Task 15) has not run, so none of them claims evidence yet.
+
+| Claim                                                                                                                            | Evidence                                                                                | Status                                    |
+| -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------- |
+| A second user's sandbox never receives the first user's credential (spec §1.2 item 3)                                            | live: a second user's sandbox, no credential, gets a `401` from `gh api user`           | pending live acceptance (Task 15)         |
+| The token is absent from the guest's environment, files and `/proc/*/mem` (spec §1.2 item 4)                                     | live: scan for the token's value after an authenticated push                            | pending live acceptance (Task 15)         |
+| The placeholder is inert: sent directly to `api.github.com` it gets `401` (spec §1.2 item 5)                                     | live: request from outside the sandbox                                                  | pending live acceptance (Task 15)         |
+| Phase 1 resolves by owner: a stolen host token yields the credentials of live sandboxes on that host (spec §8)                   | bounded by E4 (one token per host, that host's workers only) and audited per issuance   | Accepted risk; closed by ADR-0046 phase 2 |
+| A `Set-Cookie` an upstream mints from the injected token reaches the guest and can outlive revocation until it expires (spec §8) | the user scopes the token (E8); the operator allowlists only trusted upstreams          | Accepted risk                             |
+| An upstream that echoes request headers into a response body returns the token to the guest (spec §8)                            | `TRACE`/`TRACK` are refused (405), an application-level echo cannot be; same mitigation | Accepted risk                             |
+
 ## 3. What SBX0 does not claim
 
 - **Defense against a compromised relay.** The worker does not re-verify tokens; a relay that is
