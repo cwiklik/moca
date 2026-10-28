@@ -450,7 +450,7 @@ mocactl sbx credentials add docs-mcp --host mcp.corp.example/docs --kind bearer 
 
 A destination is `host[:port][/prefix]`: the port defaults to 443, and a prefix limits the token
 to that path (several MCP servers behind one gateway each get their own). Wildcard hosts are not
-supported. Two of your credentials cannot share one destination (`409 destination_conflict`).
+supported. Two of your credentials cannot hold the identical destination (`409 destination_conflict`); nested prefixes such as `mcp.corp.example` and `mcp.corp.example/jira` are fine, and the longest matching prefix wins.
 
 ### Things to know
 
