@@ -110,3 +110,12 @@ co-authorship. A `commit-msg` hook in `scripts/hooks/commit-msg` enforces this
 automatically (it rewrites AI co-author trailers to `Assisted-By`); the standard
 `pre-commit install` sets it up via `default_install_hook_types` in
 `.pre-commit-config.yaml`.
+
+## PR Description Attribution
+
+In PR descriptions, summaries, and any PR metadata, acknowledge AI assistance with a
+single `Assisted-By: Claude Code` line — never `Generated with Claude Code`,
+`Created with Claude Code`, or the 🤖 footer line. The work is the developer's;
+Claude Code assists. The same rule applies to auto-generated changelogs and release
+notes. A CI check (`.github/workflows/pr-attribution.yml`) rejects PR bodies that
+contain the prohibited footers.
