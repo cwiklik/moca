@@ -584,7 +584,7 @@ mocactl sbx doctor
 ```
 ok - login: logged in to https://<api host> as <your GitHub login>
 ok - sandbox: sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default) is ready; expires 2026-10-26T09:00:00.000Z, in 6 d 23 h
-ok - agent config: Claude Code, OpenCode and IBM Bob use the sandbox MCP server, with every local tool denied in this repository's project config except Bob's, which it has no way to deny; user-level and managed settings are not checked
+ok - agent config: Claude Code, OpenCode and IBM Bob use the sandbox MCP server, with every local tool denied in this repository's project config except Bob's, which has no deny list, so its own tools stay available; user-level and managed settings are not checked
 ok - exec: one `true` in a fresh VM: 412 ms
 ok - changes: nothing to pull
 ok - recent calls: 42 calls in the last 24 h: p50 380 ms, p95 1210 ms, 1 error (0 not the command's own)

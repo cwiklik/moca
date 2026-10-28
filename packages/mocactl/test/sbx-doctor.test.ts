@@ -199,7 +199,7 @@ describe('mocactl sbx doctor (SBX0 §6.1)', () => {
     expect(detail).toContain('user-level and managed settings are not checked');
     // Bob is in the check, and its local tools are not denied: say so rather than imply parity.
     expect(detail).toContain('IBM Bob');
-    expect(detail).toMatch(/no way to deny|not denied/);
+    expect(detail).toContain('its own tools stay available');
   });
 
   it('fails the agent-config check when an OpenCode agent re-enables a tool', async () => {
