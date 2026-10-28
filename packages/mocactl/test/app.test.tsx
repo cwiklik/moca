@@ -7,7 +7,7 @@ import { render } from 'ink-testing-library';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { ApiError, TurnCancelledError } from '../src/api/errors.js';
 import type { ControlPlaneApi } from '../src/api/types.js';
-import { App, CLEAR_SCREEN, initialOverlay } from '../src/app.js';
+import { App, CLEAR_SCREEN, RESIZE_SETTLE_MS, initialOverlay } from '../src/app.js';
 import { loadAuth, loadConfig, saveAuth } from '../src/config.js';
 import { describeError } from '../src/core/messages.js';
 import type { Runtime } from '../src/runtime.js';
@@ -71,7 +71,11 @@ function mountInteractive(rt: Runtime) {
   onTestFinished(() => instance.unmount());
   const all = () => stdout.frames.join('');
   const until = (cond: () => boolean) => waitFor(cond, 1500, () => all().slice(-2000));
-  return { stdin, os, write, rawMode, all, until };
+  const resize = (columns: number) => {
+    stdout.columns = columns;
+    stdout.emit('resize');
+  };
+  return { stdin, os, write, rawMode, all, until, resize };
 }
 
 const sessionList = (...ids: string[]) =>
@@ -1050,6 +1054,32 @@ describe('App', () => {
     expect(os.editText).toHaveBeenCalledTimes(1);
     expect(rawDuringEdit).toBe(false);
     expect(rawMode.at(-1)).toBe(true);
+  });
+
+  it('re-prints history at the new width once a resize settles', async () => {
+    const rt = testRuntime({
+      harness: fakeHarness([{ frames: [{ type: 'text', delta: 'reply' }, doneFrame('s-new')] }]),
+    });
+    const { stdin, write, all, until, resize } = mountInteractive(rt);
+    await until(() => all().includes('type a message'));
+    await send(stdin, 'hi');
+    await until(() => all().includes('reply') && all().includes('idle'));
+    write.mockClear();
+    const printed = all().length;
+    // A drag fires a burst of resizes; each one inside the settle window restarts it, so only the
+    // settled width is redrawn, and only once.
+    resize(80);
+    await tick(RESIZE_SETTLE_MS / 2);
+    resize(70);
+    await tick(RESIZE_SETTLE_MS / 2);
+    expect(write).not.toHaveBeenCalledWith(CLEAR_SCREEN);
+    resize(60);
+    await tick(RESIZE_SETTLE_MS / 2);
+    expect(write).not.toHaveBeenCalledWith(CLEAR_SCREEN);
+    await until(() => write.mock.calls.length > 0);
+    await tick(RESIZE_SETTLE_MS * 2);
+    expect(write.mock.calls).toEqual([[CLEAR_SCREEN]]);
+    expect(all().slice(printed)).toContain('› hi');
   });
 
   it('exports the transcript and opens it with the terminal handed over', async () => {

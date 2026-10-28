@@ -59,6 +59,8 @@ import { formatUsage } from './views/format.js';
 import { describeTurn, type StatusField } from './views/status.js';
 import { useSession, type SessionView } from './views/useSession.js';
 
+/** How long the terminal width must hold still before history is re-printed at it. */
+export const RESIZE_SETTLE_MS = 100;
 export const CLEAR_SCREEN = '\u001b[2J\u001b[3J\u001b[H';
 const BELL_IDLE_MS = 10_000;
 const TOAST_MS = 5000;
@@ -105,7 +107,7 @@ function retire(s: ActiveSession | undefined): void {
 
 export function App({ rt, opts, env, os, write }: AppProps) {
   const { exit, suspendTerminal } = useApp();
-  const { columns: width } = useWindowSize();
+  const { columns: width, rows } = useWindowSize();
   const [themeName, setThemeName] = useState(rt.config.theme);
   const [details, setDetails] = useState(rt.config.details);
   const [thinking, setThinking] = useState(rt.config.thinking);
@@ -311,6 +313,19 @@ export function App({ rt, opts, env, os, write }: AppProps) {
     if (mounted.current) redraw();
     mounted.current = true;
   }, [attached]);
+
+  // History printed through <Static> was wrapped at the old width, and the terminal re-wraps it on
+  // its own, so a width change re-prints it at the new one. A drag fires many resizes; wait for it
+  // to settle and redraw once. Height alone does not touch history (Chat caps the live region).
+  const printedWidth = useRef(width);
+  useEffect(() => {
+    if (width === printedWidth.current) return;
+    const timer = setTimeout(() => {
+      printedWidth.current = width;
+      redraw();
+    }, RESIZE_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [width]);
 
   // Every exit path (ctrl+c included, which unmounts without host.quit) stops the attached
   // session, so an in-flight turn's stream cannot keep the process alive with no UI.
@@ -710,6 +725,7 @@ export function App({ rt, opts, env, os, write }: AppProps) {
         details={details}
         thinking={thinking}
         width={width}
+        rows={rows}
         staticKey={staticKey}
         statusFields={fields}
         inputActive={!overlay && !leader}

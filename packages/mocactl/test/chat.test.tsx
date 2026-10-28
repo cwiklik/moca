@@ -17,6 +17,7 @@ describe('Chat', () => {
           details={false}
           thinking
           width={80}
+          rows={40}
           staticKey={0}
           statusFields={[{ key: 'turn', text: 'streaming 1.0s' }]}
           inputActive
@@ -41,6 +42,7 @@ describe('Chat', () => {
           details={false}
           thinking
           width={80}
+          rows={40}
           staticKey={0}
           statusFields={[]}
           inputActive={false}
@@ -62,6 +64,7 @@ describe('Chat', () => {
           details={false}
           thinking
           width={80}
+          rows={40}
           staticKey={0}
           statusFields={[]}
           inputActive
@@ -81,5 +84,37 @@ describe('Chat', () => {
     expect(f).toContain('control plane 0.5.1');
     // The banner is the first thing <Static> prints, ahead of any settled block.
     expect(f.indexOf('› hello')).toBeGreaterThan(f.indexOf('control plane 0.5.1'));
+  });
+
+  it('caps a tall streaming reply to the window: newest lines, then the input and status line', () => {
+    let s = addUser(EMPTY_BLOCKS, 'hello');
+    const reply = Array.from({ length: 50 }, (_, i) => `reply line ${i}`).join('\n');
+    s = reduceFrame(s, { type: 'text', delta: reply });
+    const { lastFrame } = render(
+      withTheme(
+        <Chat
+          blocks={s}
+          details={false}
+          thinking
+          width={80}
+          rows={10}
+          staticKey={0}
+          statusFields={[{ key: 'turn', text: 'streaming 1.0s' }]}
+          inputActive
+          history={[]}
+          onSubmit={vi.fn()}
+          onHelp={vi.fn()}
+        />,
+      ),
+    );
+    // ink-testing-library prepends the <Static> output (the settled `› hello`) to the live frame.
+    const all = (lastFrame() ?? '').split('\n');
+    const lines = all.slice(all.findIndex((l) => l.includes('› hello')) + 1);
+    // A row short of the window, so Ink redraws in place instead of clearing the screen.
+    expect(lines.length).toBeLessThanOrEqual(9);
+    expect(lines.at(-1)).toContain('streaming 1.0s');
+    expect(lines.at(-2)).toMatch(/^╰/);
+    expect(lines.join('\n')).toContain('reply line 49');
+    expect(lines.join('\n')).not.toMatch(/reply line 0\b/);
   });
 });
