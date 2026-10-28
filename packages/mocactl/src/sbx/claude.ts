@@ -19,9 +19,14 @@ import { SERVER } from './agent-config.js';
  * project-scoped copy in `.mcp.json` from being loaded and asked about as well (verified
  * against claude 2.1.308, from the root, from a subdirectory, and over a past decline).
  *
+ * The one question no flag takes away is the folder trust itself: a folder Claude Code has
+ * never trusted gets its trust dialog once, whatever is passed (the default exits; answering
+ * yes records the trust for the folder, and subdirectories inherit it). Harmless, but not
+ * nothing — the messages and docs say "asks nothing about the server", not "asks nothing".
+ *
  * `--strict-mcp-config` also means the session loads no MCP server but this one. That is the
  * same containment `up` applies when it denies the local tools: the agent works through the
- * sandbox. Run `claude` yourself when you want your other servers, and answer its one question.
+ * sandbox. Run `claude` yourself when you want your other servers, and answer its questions.
  */
 
 /**

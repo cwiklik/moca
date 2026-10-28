@@ -65,11 +65,12 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx mcp [--sandbox ID]                 the stdio MCP server for Claude Code / OpenCode
   mocactl sbx claude [-- CLAUDE_ARGS ...]        run Claude Code on this sandbox's MCP tools, for
                                                  one run (--mcp-config + --strict-mcp-config,
-                                                 nothing written, nothing asked: the first
-                                                 bare claude session's approval question and its
-                                                 folder trust are why this exists, #577. The
-                                                 session loads no MCP server but the sandbox's;
-                                                 run claude yourself for your own servers)
+                                                 nothing written, no approval asked: the first
+                                                 bare claude session's approval question is why
+                                                 this exists, #577; Claude Code still asks once
+                                                 whether you trust the folder. The session loads
+                                                 no MCP server but the sandbox's; run claude
+                                                 yourself for your own servers)
   mocactl sbx codex [-- CODEX_ARGS ...]          run Codex CLI on this sandbox's MCP tools, for one
                                                  run (-c, nothing written: Codex reads no
                                                  project-local config, so up cannot configure it).
