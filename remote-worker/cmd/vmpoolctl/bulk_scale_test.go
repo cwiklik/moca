@@ -71,14 +71,22 @@ func TestTeardownBulkFanOutIsBoundedByItsOwnKnobNotIterations(t *testing.T) {
 		t.Errorf("Failures = %d with a small fan-out over many iterations, want 0", rec.Failures)
 	}
 
-	// One iteration, fan-out far past the budget: must still refuse, so the assertion
-	// above is about sizing and not about a disabled gate. 512 keys x D2 x 288 MiB is
+	// One iteration, fan-out far past the budget: 512 keys x D2 x 288 MiB is
 	// ~288 GiB against the 32 GiB default.
+	//
+	// #644 changed what "hitting the budget" looks like for the paused component:
+	// a fan-out past the budget now SHEDS the earlier runs' standbys
+	// (evictForBudgetLocked) rather than refusing, because a dropped standby costs
+	// a cold acquire while a refusal costs a turn. The reachability assertion
+	// therefore moved from the refusal counter to the eviction counter — the gate
+	// must still bite, measurably, or the metal-scale test above proves nothing;
+	// it just bites as churn now. (Refusing is still reachable, via the running
+	// component: see TestAWarmAcquireIsRepricedAtPopTime in internal/vmpool.)
 	rec2, _, err2 := bulkRecord(t, "--iterations=1", "--warmup=0", "--bulk-keys=512")
-	if err2 == nil {
-		t.Fatal("a 512-key batch was admitted against a 32 GiB budget — admission control is not reachable from this mode, so the metal-scale test above proves nothing")
+	if err2 != nil {
+		t.Fatalf("a 512-key batch returned %v — eviction, not refusal, is what a standby-side overflow looks like since #644", err2)
 	}
-	if rec2.Failures == 0 {
-		t.Errorf("Failures = 0 on a batch the budget must refuse; the refusal was not counted")
+	if rec2.BudgetEvictions == 0 {
+		t.Fatal("a 512-key batch against a 32 GiB budget evicted nothing — admission pressure is not reachable from this mode, so the metal-scale test above proves nothing")
 	}
 }

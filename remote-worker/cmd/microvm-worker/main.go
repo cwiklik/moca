@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	_ "net/http/pprof"
@@ -83,31 +84,32 @@ func envInt64(get func(string) string, k string, def int64) (int64, error) {
 // where slots stop paying is its own sweep. The default must not wander past the evidence.
 const microvmDefaultConcurrency = 16
 
-// slotBudgetWarning returns a warning when the slot count can commit more VM memory than
-// the admission budget allows, or "" when it fits.
+// slotBudgetWarning returns a warning when the slot count can commit more RUNNING VM
+// memory than the admission budget allows, or "" when it fits.
 //
-// Raising this tier's default from 4 to 16 multiplies VM commitment, not just the
-// 2 x exec.BufferCap of stream buffer the default's rationale reasons about.
-// committedLocked sums ready+inFlight+warming across run pools and StandbyDepth is per RUN
-// KEY, so N slots carrying distinct workspace_keys commit up to N x (1 + D) VMs: 48 at 16
-// slots and the shipped D=2, ~13.5 GiB at a 256 MiB guest, against 12 VMs / ~3.4 GiB at 4.
+// #644 split the admission charge by VM state: running (and warming) VMs at full
+// PerVMBytes, paused standbys at their measured dirty-page cost. That makes the
+// slot count's arithmetic the RUNNING component alone — N slots can commit
+// N x PerVMBytes — and it is a hard ceiling now rather than a worst case: the pool
+// re-prices a standby at full cost at pop time (admitPromotionLocked), so a host
+// whose slots x PerVMBytes outrun the budget will refuse warm acquires — failed
+// execs — as the slot count fills. Paused standbys over the budget are no longer
+// this warning's subject: they evict (evictForBudgetLocked) rather than fail, and
+// their booking is bounded by dirty pages rather than by slots.
 //
-// Overflow does not arrive as back-pressure. admitLocked returns RefuseMemoryBudget, and
-// budget.go records that there is no "busy" frame on the wire, so a refusal "reaches the
-// harness as a failed exec". An operator who sized SH_MAX_COMMITTED_MB for 4 slots by
-// following METAL-RUNBOOK's "size it to this host" would now see hard exec errors under
-// concurrency, with nothing at startup having said why.
-//
-// WARNS rather than refusing, deliberately. The N x (1 + D) figure is a WORST CASE that
-// needs N distinct workspace keys; a single session holds one key and commits 1 x (1 + D)
-// however many slots exist. Failing the unit would stop deployments that work today and
-// whose worst case never materialises. The runtime gate still refuses, so the risk is
-// degraded service rather than silent corruption -- but the operator is told at startup,
-// which is the whole point of #305: a slot count nobody chose must not be invisible.
+// STILL WARNS rather than refusing, deliberately. Full slot occupancy is itself a
+// worst case that needs N concurrent Execs; a single session holds one VM however
+// many slots exist. Failing the unit would stop deployments whose worst case never
+// materialises — the same reasoning the pre-#644 version of this warning recorded,
+// now applying to a figure that bites as refusals rather than as evictions. The
+// runtime gate (admitPromotionLocked) still protects the host, so the risk is
+// degraded service rather than silent corruption -- but the operator is told at
+// startup, which is the whole point of #305: a slot count nobody chose must not be
+// invisible.
 func slotBudgetWarning(cfg vmpool.Config, maxConcurrent int) string {
-	// Normalize a COPY: it is what fills VMOverheadBytes, and it runs inside vmpool.New on
-	// New's own copy, so main's cfg can still carry a zero here and PerVMBytes would
-	// understate the commitment.
+	// Normalize a COPY: it is what fills VMOverheadBytes and StandbyHeadroom, and it
+	// runs inside vmpool.New on New's own copy, so main's cfg can still carry a zero
+	// here and PerVMBytes would understate the commitment.
 	c := cfg
 	if err := c.Normalize(); err != nil {
 		return ""
@@ -116,17 +118,17 @@ func slotBudgetWarning(cfg vmpool.Config, maxConcurrent int) string {
 	if budget <= 0 {
 		return ""
 	}
-	worst := int64(maxConcurrent) * int64(1+c.StandbyDepth) * vmpool.PerVMBytes(c)
-	if worst <= budget {
+	running := int64(maxConcurrent) * vmpool.PerVMBytes(c)
+	if running <= budget {
 		return ""
 	}
 	return fmt.Sprintf(
-		"WARNING: %d concurrency slots at D=%d can commit %d VMs (%d MiB) but the admission budget is %d MiB "+
-			"(SH_MAX_COMMITTED_MB minus SH_MEMORY_RESERVE_MB). That worst case needs %d distinct workspace keys; "+
-			"reaching it returns RefuseMemoryBudget, which arrives at the harness as a FAILED EXEC rather than as "+
-			"back-pressure. Raise SH_MAX_COMMITTED_MB or lower WORKER_MAX_CONCURRENT.",
-		maxConcurrent, c.StandbyDepth, int64(maxConcurrent)*int64(1+c.StandbyDepth),
-		worst>>20, budget>>20, maxConcurrent)
+		"WARNING: %d concurrency slots x %d MiB per VM = %d MiB of RUNNING VMs against an "+
+			"admission budget of %d MiB (SH_MAX_COMMITTED_MB minus SH_MEMORY_RESERVE_MB). Since #644 a "+
+			"warm acquire is re-priced at full cost when it is popped, so a full slot load will refuse "+
+			"Execs with memory-budget rather than run past the budget. Raise SH_MAX_COMMITTED_MB, lower "+
+			"WORKER_MAX_CONCURRENT, or lower SH_GUEST_RAM_MB.",
+		maxConcurrent, vmpool.PerVMBytes(c)>>20, running>>20, budget>>20)
 }
 
 // workerMaxConcurrent resolves the worker's concurrency-slot count.
@@ -193,6 +195,35 @@ func poolConfig(get func(string) string) (vmpool.Config, error) {
 			cfg.MemoryReserveBytes = v << 20
 		}
 	}
+	// SH_STANDBY_HEADROOM (#644): the multiplier on a paused standby's measured
+	// dirty-page footprint. "full" restores the pre-#644 full-RAM charge on the same
+	// binary; a number must be >= 1 (vmpool's Normalize re-checks, but refusing HERE
+	// keeps the message with the other env errors). Unset leaves the field 0, which
+	// Normalize fills with vmpool.DefaultStandbyHeadroom — so the rung record is the
+	// banner, which prints the resolved value either way.
+	if v := get("SH_STANDBY_HEADROOM"); v != "" {
+		if v == "full" {
+			cfg.StandbyHeadroom = math.Inf(1)
+		} else {
+			h, e := strconv.ParseFloat(v, 64)
+			if (e != nil || h < 1) && err == nil {
+				err = fmt.Errorf("SH_STANDBY_HEADROOM=%q must be \"full\" or a number >= 1", v)
+			} else if e == nil {
+				cfg.StandbyHeadroom = h
+			}
+		}
+	}
+	// SH_HOST_MEM_FLOOR_MB (#644): opt-in host backstop — refuse admission when the
+	// host's MemAvailable drops below this, so dirty-page accounting is never the
+	// only OOM protection. Unset = off; vmpool fails closed if it is set but
+	// /proc/meminfo cannot be read.
+	if get("SH_HOST_MEM_FLOOR_MB") != "" {
+		if v, e := envInt64(get, "SH_HOST_MEM_FLOOR_MB", 0); e != nil && err == nil {
+			err = e
+		} else if e == nil {
+			cfg.HostMemFloorBytes = v << 20
+		}
+	}
 	// SH_WORKSPACE_IDLE is the ONLY trigger that deletes a session's workspace (#338), and the
 	// 30-minute default reclaims a human-in-the-loop session that is merely waiting on a person.
 	// A deployment that serves interactive sessions sets it longer. It is not free: workspace disk
@@ -217,6 +248,21 @@ func effectiveWorkspaceIdle(cfg vmpool.Config) time.Duration {
 		return cfg.WorkspaceIdle
 	}
 	return vmpool.DefaultWorkspaceIdle
+}
+
+// standbyHeadroomLabel is what the banner prints for the resolved headroom: the
+// number, or "full" for +Inf (the pre-#644 charge). The banner is the rung record
+// for this knob — a density ladder is not readable without knowing which charge
+// model priced its standbys (#644), the same reason it prints slots and D.
+func standbyHeadroomLabel(cfg vmpool.Config) string {
+	h := cfg.StandbyHeadroom
+	if h == 0 {
+		h = vmpool.DefaultStandbyHeadroom
+	}
+	if math.IsInf(h, 1) {
+		return "full"
+	}
+	return strconv.FormatFloat(h, 'g', -1, 64)
 }
 
 // launcherFor maps a VMMKind to a Launcher.
@@ -436,13 +482,19 @@ func jitter(d time.Duration) time.Duration {
 // should not change silently because an internal field was renamed. Field-for-field
 // otherwise, and the two maps are stringified the way vmpoolctl already does it.
 type diagStats struct {
-	InFlight             int    `json:"inFlight"`
-	ActiveRuns           int    `json:"activeRuns"`
-	ParkedRuns           int    `json:"parkedRuns"`
-	StandbysResident     int    `json:"standbysResident"`
-	IdleStandbyResidency int    `json:"idleStandbyResidency"`
-	CommittedBytes       int64  `json:"committedBytes"`
-	WarmAcquires         uint64 `json:"warmAcquires"`
+	InFlight             int   `json:"inFlight"`
+	ActiveRuns           int   `json:"activeRuns"`
+	ParkedRuns           int   `json:"parkedRuns"`
+	StandbysResident     int   `json:"standbysResident"`
+	IdleStandbyResidency int   `json:"idleStandbyResidency"`
+	CommittedBytes       int64 `json:"committedBytes"`
+	// The PAUSED component of committedBytes (#644), beside the total for the same
+	// reason BudgetEvictions sits beside Refusals["memory-budget"]: only the pair
+	// tells a density ladder whether the ceiling it stopped on was running VMs (a
+	// real memory bound) or the standby booking (bookkeeping). Field-for-field with
+	// vmpool.Stats otherwise.
+	StandbyCommittedBytes int64  `json:"standbyCommittedBytes"`
+	WarmAcquires          uint64 `json:"warmAcquires"`
 	// Reported by the worker rather than recorded by the driver from what it believes it
 	// set. Every E11 microVM rung ever recorded swept c to 64 against a 4-slot cap the
 	// driver never set and never wrote down, and at every point measured so far it was
@@ -473,23 +525,24 @@ type diagStats struct {
 
 func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
 	out := diagStats{
-		MaxConcurrent:        maxConcurrent,
-		InFlight:             st.InFlight,
-		ActiveRuns:           st.ActiveRuns,
-		ParkedRuns:           st.ParkedRuns,
-		StandbysResident:     st.StandbysResident,
-		IdleStandbyResidency: st.IdleStandbyResidency,
-		CommittedBytes:       st.CommittedBytes,
-		WarmAcquires:         st.WarmAcquires,
-		ColdAcquires:         map[string]uint64{},
-		Refusals:             map[string]uint64{},
-		Replenishments:       st.Replenishments,
-		ReplenishFailures:    st.ReplenishFailures,
-		DestroyFailures:      st.DestroyFailures,
-		ReapsInline:          st.ReapsInline,
-		BarrierUnobserved:    st.BarrierUnobserved,
-		TimeoutsClamped:      st.TimeoutsClamped,
-		BudgetEvictions:      st.BudgetEvictions,
+		MaxConcurrent:         maxConcurrent,
+		InFlight:              st.InFlight,
+		ActiveRuns:            st.ActiveRuns,
+		ParkedRuns:            st.ParkedRuns,
+		StandbysResident:      st.StandbysResident,
+		IdleStandbyResidency:  st.IdleStandbyResidency,
+		CommittedBytes:        st.CommittedBytes,
+		StandbyCommittedBytes: st.StandbyCommittedBytes,
+		WarmAcquires:          st.WarmAcquires,
+		ColdAcquires:          map[string]uint64{},
+		Refusals:              map[string]uint64{},
+		Replenishments:        st.Replenishments,
+		ReplenishFailures:     st.ReplenishFailures,
+		DestroyFailures:       st.DestroyFailures,
+		ReapsInline:           st.ReapsInline,
+		BarrierUnobserved:     st.BarrierUnobserved,
+		TimeoutsClamped:       st.TimeoutsClamped,
+		BudgetEvictions:       st.BudgetEvictions,
 	}
 	for k, v := range st.ColdAcquires {
 		out.ColdAcquires[string(k)] = v
@@ -716,9 +769,10 @@ func main() {
 	// nothing in journalctl naming the number, and /stats is gated behind the opt-in
 	// SH_DIAG_STATS_ADDR. cmd/worker logs the same thing as capacity=%d. #305's own thesis
 	// is that a run whose slots came from a typo must not look like a run that chose them.
-	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB slots=%d workspace_idle=%s labels=%v",
+	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB slots=%d standby_headroom=%s mem_floor=%dMiB workspace_idle=%s labels=%v",
 		relayAddr, env(get, "SANDBOX_ID", "sbx-microvm-1"), useTLS, cfg.VMM,
 		cfg.StandbyDepth, cfg.GuestRAMBytes>>20, cfg.MaxCommittedBytes>>20, maxConcurrent,
+		standbyHeadroomLabel(cfg), cfg.HostMemFloorBytes>>20,
 		effectiveWorkspaceIdle(cfg), labels)
 	if w := slotBudgetWarning(cfg, maxConcurrent); w != "" {
 		log.Printf("microvm-worker: %s", w)

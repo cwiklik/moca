@@ -407,6 +407,32 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, *runPool, ColdCause
 
 		if n := len(rp.ready); n > 0 {
 			vm := rp.ready[n-1]
+			// The promotion check (#644): popping this standby re-prices it from its
+			// dirty-page charge to a full PerVMBytes, and that must still fit the
+			// budget. Checked BEFORE the pop mutates anything — the check is pure, and
+			// a refusal must leave the standby exactly where it was for a later,
+			// colder host to promote. On a host whose slots x PerVMBytes fit the
+			// budget this never fires; see admitPromotionLocked.
+			if err := p.admitPromotionLocked(vm); err != nil {
+				// RefuseMemoryBudget is fundable: eviction needs only
+				// perVM minus this standby's dirty charge of headroom, which other
+				// idle runs' standbys can cover — without it, a standby-heavy host
+				// (replenishment books the budget to within one warming of full)
+				// would fail warm acquires far below the slot ceiling, which is the
+				// density regression #644 exists to remove. rp is excluded from the
+				// victims, so the pop's slice arithmetic below stays valid.
+				// RefuseHostMemory is NOT fundable this way: reclaimLoop destroys
+				// asynchronously, so MemAvailable is unchanged at the re-check and
+				// the standbys would be burned for a refusal either way.
+				if ReasonOf(err) == RefuseMemoryBudget {
+					p.evictForPromotionLocked(rp, vm)
+					err = p.admitPromotionLocked(vm)
+				}
+				if err != nil {
+					p.mu.Unlock()
+					return nil, nil, "", p.countRefusal(err)
+				}
+			}
 			rp.ready = rp.ready[:n-1]
 			rp.inFlight++
 			p.mu.Unlock()
@@ -673,6 +699,7 @@ func (p *pool) Stats() Stats {
 		}
 	}
 	s.CommittedBytes = p.committedLocked()
+	s.StandbyCommittedBytes = p.standbyCommittedLocked()
 	p.mu.Unlock()
 	p.counters.snapshot(&s)
 	// Read off the reaper rather than the counters: it owns the number, and a nil reaper
@@ -681,10 +708,10 @@ func (p *pool) Stats() Stats {
 	return s
 }
 
-// perVMBytes is what one VM costs the budget. A standby is charged its FULL guest
-// RAM even though it is paused and CoW-shared, because it is one Resume away from
-// consuming all of it — admission control that charged the paused footprint would
-// admit a host it cannot then run (spec §6, §7.3).
+// perVMBytes is what one RUNNING VM costs the budget: full guest RAM plus
+// overhead, charged to inFlight and warming VMs (and to a standby at the moment
+// of its promotion — admitPromotionLocked). A paused standby is charged at
+// dirty-page cost instead; see committedLocked and standbyChargeLocked (#644).
 //
 // Delegates to the package-level PerVMBytes so this figure and the per-VM cgroup
 // memory.max Task 17 sets (both arms) are computed from one function, not two

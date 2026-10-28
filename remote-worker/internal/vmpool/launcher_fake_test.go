@@ -27,8 +27,9 @@ type fakeLauncher struct {
 	runFn         func(*fakeVM, Command, Sink) (Result, error)
 	resumeFn      func(*fakeVM, context.Context) error
 	destroyErr    error
-	keyOverride   string // hand back a VM bound to this key instead of the requested one
-	serialize     bool   // SerializesExecsPerRun's return value; false unless a test sets it
+	keyOverride   string                       // hand back a VM bound to this key instead of the requested one
+	serialize     bool                         // SerializesExecsPerRun's return value; false unless a test sets it
+	standbyFn     func(*fakeVM) (int64, error) // fakeVM.StandbyBytes' answer; nil = "unreadable"
 }
 
 func newFakeLauncher() *fakeLauncher {
@@ -103,6 +104,23 @@ func (l *fakeLauncher) setResumeFn(f func(*fakeVM, context.Context) error) {
 
 func (l *fakeLauncher) setKeyOverride(k string) { l.mu.Lock(); l.keyOverride = k; l.mu.Unlock() }
 
+// setStandbyFn installs the paused-footprint answer every fakeVM reports through
+// StandbyBytes — the seam standbyChargeLocked prices a standby from (#644). nil
+// (the default) makes every fake VM report an error, which standbyChargeLocked
+// prices at FULL PerVMBytes: tests that do not opt in keep the pre-#644
+// accounting and the numbers the rest of this suite already asserts.
+func (l *fakeLauncher) setStandbyFn(f func(*fakeVM) (int64, error)) {
+	l.mu.Lock()
+	l.standbyFn = f
+	l.mu.Unlock()
+}
+
+func (l *fakeLauncher) getStandbyFn() func(*fakeVM) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.standbyFn
+}
+
 func (l *fakeLauncher) createdCount() int { l.mu.Lock(); defer l.mu.Unlock(); return l.created }
 
 func (l *fakeLauncher) liveCount() int { l.mu.Lock(); defer l.mu.Unlock(); return len(l.live) }
@@ -137,6 +155,18 @@ type fakeVM struct {
 
 func (v *fakeVM) Key() string { return v.key }
 func (v *fakeVM) ID() string  { return v.id }
+
+// StandbyBytes implements standbyFootprinter (budget.go) for tests that opt in
+// via setStandbyFn. With no fn installed it errors, and standbyChargeLocked's
+// fallback charges full PerVMBytes — deliberately, so the default fake keeps the
+// pre-#644 full-RAM charge and the existing suite's arithmetic holds unchanged.
+func (v *fakeVM) StandbyBytes() (int64, error) {
+	fn := v.lc.getStandbyFn()
+	if fn == nil {
+		return 0, fmt.Errorf("fakeVM %s: no standby footprint configured", v.id)
+	}
+	return fn(v)
+}
 
 func (v *fakeVM) Resume(ctx context.Context) error {
 	v.mu.Lock()

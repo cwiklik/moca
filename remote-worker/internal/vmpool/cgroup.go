@@ -374,6 +374,28 @@ func writeMemoryMax(dir string, bytes int64) error {
 	return nil
 }
 
+// readMemoryCurrent reads a cgroup's memory.current — the bytes it is holding
+// right now, anonymous and charged file cache both. This is what
+// standbyChargeLocked prices a paused standby at (#644): on a host whose golden
+// memfile is mlocked and faulted by the WORKER at startup, a standby's cgroup sees
+// only the pages that VM dirtied itself (E11: 0.9 MiB mean / 2 MiB max against a
+// 288 MiB memory.max), because the shared snapshot pages are charged to the cgroup
+// that first faulted them in — the worker's. memory.current is bounded by the
+// memory.max writeMemoryMax above set from the same PerVMBytes, so an honest read
+// can never exceed what the budget already prices a fully-dirtied VM at.
+func readMemoryCurrent(dir string) (int64, error) {
+	path := filepath.Join(dir, "memory.current")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("vmpool: reading %s: %w", path, err)
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("vmpool: parsing %s %q: %w", path, string(b), err)
+	}
+	return n, nil
+}
+
 // SweepResult reports what one sweep did AND what it deliberately refused to touch.
 //
 // Skipped is not decoration. A fail-closed filter and a broken filter look identical

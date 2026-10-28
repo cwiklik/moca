@@ -41,9 +41,16 @@ var ErrGuest = errors.New("vmpool: guest error")
 type RefusalReason string
 
 const (
-	RefuseEmptyKey      RefusalReason = "empty-workspace-key"
-	RefuseInvalidKey    RefusalReason = "invalid-workspace-key"
-	RefuseMemoryBudget  RefusalReason = "memory-budget"
+	RefuseEmptyKey     RefusalReason = "empty-workspace-key"
+	RefuseInvalidKey   RefusalReason = "invalid-workspace-key"
+	RefuseMemoryBudget RefusalReason = "memory-budget"
+	// RefuseHostMemory is #644's host backstop: the host's own MemAvailable fell
+	// below the operator's floor. Kept DISTINCT from RefuseMemoryBudget for the
+	// same spec §6 reason MaxRuns is: a budget refusal means SH_MAX_COMMITTED_MB
+	// is sized wrong, a host-floor refusal means the host is genuinely out —
+	// different knobs, and a density ladder needs to tell them apart at its
+	// stopping rung.
+	RefuseHostMemory    RefusalReason = "host-memory"
 	RefuseMaxRuns       RefusalReason = "max-runs"
 	RefuseSpawn         RefusalReason = "spawn-failure"
 	RefuseShortResponse RefusalReason = "vsock-short-response"

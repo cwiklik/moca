@@ -1,5 +1,26 @@
 package vmpool
 
+import (
+	"math"
+	"sort"
+)
+
+// standbyFootprinter is implemented by a launcher's VM when it can report its own
+// paused dirty-page cost: its per-VM cgroup's memory.current, the bytes that standby
+// is actually holding on the host right now (the guest RAM pages it dirtied itself,
+// plus the VMM's and any sidecar's anonymous memory). Both real arms implement it —
+// firecrackerVM reads its pooled cgroup, chvVM its systemd scope. A launcher that
+// cannot — the fake launcher, or a VM placed with no ParentCgroup — is charged its
+// FULL PerVMBytes by standbyChargeLocked, which is the pre-#644 posture.
+//
+// Called only while the VM is paused (a ready standby) and with pool.mu held, but
+// implementations take their own locks and CACHE the read (see firecrackerVM.
+// StandbyBytes), so the cgroupfs hit happens once per standby, not once per
+// admission check.
+type standbyFootprinter interface {
+	StandbyBytes() (int64, error)
+}
+
 // admitOrEvictLocked is admitLocked for the two call sites whose refusal is
 // USER-VISIBLE: acquire's warming charge and runLocked's new key. Caller holds p.mu.
 //
@@ -40,6 +61,15 @@ package vmpool
 func (p *pool) admitOrEvictLocked(newRun bool) error {
 	err := p.admitLocked(newRun)
 	if ReasonOf(err) != RefuseMemoryBudget {
+		// Deliberately NOT RefuseHostMemory too. Eviction funds an admission's
+		// BOOKING, which the re-admit below re-measures synchronously — but a
+		// standby's pages only return to MemAvailable once reclaimLoop has
+		// destroyed it, which is asynchronous, so a host-floor refusal is
+		// identical before and after the attempt: the caller is refused either
+		// way and the standbys are burned for nothing. Relieving host pressure
+		// is not the admission path's job; a persistent RefuseHostMemory is an
+		// operator signal (the refusal says which knob), not something to shed
+		// standbys at.
 		return err
 	}
 	p.evictForBudgetLocked()
@@ -49,75 +79,141 @@ func (p *pool) admitOrEvictLocked(newRun bool) error {
 	return p.admitLocked(newRun)
 }
 
-// evictForBudgetLocked frees one VM's worth of memory by reclaiming a standby from the
-// least-recently-used IDLE run. Caller holds p.mu. Best-effort and silent:
-// admitOrEvictLocked re-measures rather than trusting a result.
+// evictForBudgetLocked funds one admission (a warming charge or a new key's first
+// VM) by reclaiming standbys from idle runs. Caller holds p.mu. Best-effort and
+// silent: admitOrEvictLocked re-measures rather than trusting a result.
+func (p *pool) evictForBudgetLocked() {
+	p.evictForAdmissionLocked(p.perVMBytes(), nil)
+}
+
+// evictForPromotionLocked funds one warm acquire: popping vm re-prices it from its
+// dirty-page charge to a full PerVMBytes, so the headroom needed is only that
+// DIFFERENCE — which other runs' standbys can cover, one dirty charge at a time.
+// rp is the promoting run and is EXCLUDED from the victims: it is not busy yet
+// (acquire marks inFlight only after the pop), so nothing else would keep the loop
+// from handing the very standby being promoted to reclaimQ out from under the
+// caller. Caller holds p.mu.
+func (p *pool) evictForPromotionLocked(rp *runPool, vm VM) {
+	p.evictForAdmissionLocked(p.perVMBytes()-p.standbyChargeLocked(vm), rp)
+}
+
+// evictForAdmissionLocked makes `need` bytes of budget headroom by reclaiming
+// standbys from the least-recently-used IDLE runs, `exclude` never a victim.
+// Caller holds p.mu. Best-effort and silent: every caller re-measures rather than
+// trusting a result.
+//
+// AS MUCH AS THE ADMISSION NEEDS, NOT ONE VM (#644). Under the pre-#644 full-RAM
+// charge one standby WAS one VM's worth of budget, so a single eviction always
+// covered a refusal's shortfall (committed <= budget means the shortfall is at most
+// one PerVMBytes). Under dirty-page charging a standby frees only its dirty-page
+// charge, so funding one full-price admission can take several: on SBX0 (perVM
+// ~4128 MiB against a 32 MiB floor) as many as ~129. Victims are gathered
+// coldest-run-first until their combined charge covers the shortfall, then handed
+// to reclaimLoop as ONE batch — one reclaimQ slot per call regardless of how many
+// VMs it sheds, so a large funding can no longer fill the queue (cap 64) halfway
+// and leave the sweep destroying inline on the hot path. The gather degenerates to
+// the old single eviction under SH_STANDBY_HEADROOM=full, where one standby's
+// charge is again one whole VM.
+//
+// FUTILITY IS CHECKED BEFORE ANYTHING IS DETACHED. If every evictable standby's
+// charge summed cannot cover the shortfall, the re-admit that follows will refuse
+// identically — evicting anyway would burn the coldest runs' warm state for a
+// refusal the caller suffers regardless, which is the reclaim-storm shape spec §6
+// names, reached from the hot path. Refuse instead; the standbys stay for a
+// running VM's release to matter.
 //
 // This is sweepOnce's RunActive -> RunParked transition fired by memory pressure
-// instead of by the clock: drop a standby, STOP the replenish timers that would refill
-// it, KEEP the workspace. Not firing the WorkspaceIdle half matters — a memory signal
-// is about RAM, and deleting a live session's tree to make room for a different
-// session would turn a recoverable cold start into #338's silent reset.
+// instead of by the clock: drop standbys, STOP the replenish timers that would
+// refill them, KEEP the workspace. Not firing the WorkspaceIdle half matters — a
+// memory signal is about RAM, and deleting a live session's tree to make room for
+// a different session would turn a recoverable cold start into #338's silent reset.
 //
 // WHY THIS IS CHEAP AND A REFUSAL IS NOT. An eviction costs the victim one cold
-// acquire — the exact outcome StandbyIdle (90s) already produces for any run that goes
-// quiet, with the workspace still on disk, so spec §4.4's "RAM is urgent and disk is
-// not" is honoured rather than bypassed. A refusal costs the requesting session its
-// turn.
+// acquire — the exact outcome StandbyIdle (90s) already produces for any run that
+// goes quiet, with the workspace still on disk, so spec §4.4's "RAM is urgent and
+// disk is not" is honoured rather than bypassed. A refusal costs the requesting
+// session its turn.
 //
 // LRU BY lastExec, the same clock sweepOnce's idleFor reads, so eviction order and
 // sweep order cannot disagree about which run is coldest.
 //
 // A BUSY RUN IS NEVER A CANDIDATE, for sweepOnce's reason: rp.busy() staying true is
-// what stops a reclaim landing under a running command. That also makes self-eviction
-// impossible at both call sites without a special case — runLocked's key has no
-// runPool yet, and acquire only reaches the memory gate on a run whose ready list it
-// has already found empty.
-func (p *pool) evictForBudgetLocked() {
+// what stops a reclaim landing under a running command. Together with `exclude`
+// that makes self-eviction impossible at all three call sites — runLocked's key has
+// no runPool yet, and acquire's two paths pass either a busy run (its second warm
+// acquire) or the excluded promoting run (its first).
+func (p *pool) evictForAdmissionLocked(need int64, exclude *runPool) {
 	// The send below happens UNDER p.mu and must not block, which this check is what
 	// guarantees. Every sender (here and sweep) holds p.mu, so they are totally ordered
 	// against each other, and reclaimLoop only ever drains — so capacity observed here
 	// cannot be taken by anyone else before the send. A full queue means reclamation is
 	// already behind, which is precisely the state where detaching more VMs would not
-	// free memory any sooner: refuse instead. Checked BEFORE anything leaves rp.ready,
-	// so a full queue costs nothing rather than losing a batch.
+	// free memory any sooner: refuse instead. Checked BEFORE anything leaves a ready
+	// list, so a full queue costs nothing rather than losing a batch.
 	if p.closed || len(p.reclaimQ) >= cap(p.reclaimQ) {
 		return
 	}
-
-	var victim *runPool
-	for _, rp := range p.runs {
-		if rp.busy() || len(rp.ready) == 0 {
-			continue
-		}
-		if victim == nil || rp.lastExec.Before(victim.lastExec) {
-			victim = rp
-		}
-	}
-	if victim == nil {
+	budget := p.cfg.MaxCommittedBytes - p.cfg.MemoryReserveBytes
+	shortfall := budget - p.committedLocked() - need
+	if shortfall >= 0 {
+		// The admission fits already; nothing to fund. (Reachable on the promotion
+		// path, where need is perVM minus the standby's own charge.)
 		return
 	}
 
-	// ONE VM, because one VM is what admission is short at both call sites. Taking the
-	// whole ready list would shed a coldest run's entire standby depth to admit a single
-	// warming, which is the reclaim storm spec §6 names. MaxReclaimsPerScan deliberately
-	// does not appear here: it rate-limits the background sweep's bulk munmap against
-	// the hot path, and this is already one VM on the hot path.
-	n := len(victim.ready) - 1
-	b := reclaimBatch{vms: []VM{victim.ready[n]}}
-	victim.ready = victim.ready[:n]
-	if len(victim.ready) == 0 {
-		// Stopping these is load-bearing, not tidiness: a pending replenishment would
-		// restore exactly the standby just evicted and re-consume the budget this call
-		// exists to free, turning one admission into a refill race.
-		for _, tm := range victim.pending {
-			tm.Stop()
+	// Order the donor runs coldest-first and total what they could shed. The same
+	// pass serves the futility check: if evictable < shortfall there is no point
+	// detaching anything.
+	var (
+		order     []*runPool
+		evictable int64
+	)
+	for _, rp := range p.runs {
+		if rp == exclude || rp.busy() || len(rp.ready) == 0 {
+			continue
 		}
-		victim.pending = nil
-		victim.parked = true
+		order = append(order, rp)
+		for _, vm := range rp.ready {
+			evictable += p.standbyChargeLocked(vm)
+		}
 	}
-	p.counters.evicted()
-	p.reclaimQ <- b
+	if evictable < -shortfall {
+		return
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i].lastExec.Before(order[j].lastExec) })
+
+	var (
+		batch []VM
+		freed int64
+	)
+gather:
+	for _, rp := range order {
+		for len(rp.ready) > 0 {
+			// Top of the ready list first, the same end acquire pops from.
+			n := len(rp.ready) - 1
+			vm := rp.ready[n]
+			batch = append(batch, vm)
+			freed += p.standbyChargeLocked(vm)
+			rp.ready = rp.ready[:n]
+			if len(rp.ready) == 0 {
+				// Stopping these is load-bearing, not tidiness: a pending replenishment would
+				// restore exactly the standby just evicted and re-consume the budget this call
+				// exists to free, turning one admission into a refill race.
+				for _, tm := range rp.pending {
+					tm.Stop()
+				}
+				rp.pending = nil
+				rp.parked = true
+			}
+			if freed >= -shortfall {
+				break gather
+			}
+		}
+	}
+	for range batch {
+		p.counters.evicted()
+	}
+	p.reclaimQ <- reclaimBatch{vms: batch}
 }
 
 // admitLocked decides whether one more VM may be committed. Caller holds p.mu.
@@ -164,6 +260,9 @@ func (p *pool) admitLocked(newRun bool) error {
 				"one tier up is primary admission control and this is its backstop (spec §6)",
 			p.cfg.MaxRuns, unparked, len(p.runs))
 	}
+	if err := p.hostFloorLocked(); err != nil {
+		return err
+	}
 	committed := p.committedLocked()
 	budget := p.cfg.MaxCommittedBytes - p.cfg.MemoryReserveBytes
 	if next := committed + p.perVMBytes(); next > budget {
@@ -171,6 +270,91 @@ func (p *pool) admitLocked(newRun bool) error {
 			"committing %d more bytes would reach %d against a budget of %d "+
 				"(MaxCommittedBytes %d less MemoryReserveBytes %d)",
 			p.perVMBytes(), next, budget, p.cfg.MaxCommittedBytes, p.cfg.MemoryReserveBytes)
+	}
+	return nil
+}
+
+// admitPromotionLocked re-prices one ready standby at its full PerVMBytes and
+// refuses if that would exceed the budget — the invariant that makes dirty-page
+// charging safe (#644): a host that books standbys at their measured cost must not
+// be able to promote more of them to running than it could have admitted cold.
+// Called from acquire's warm path, BEFORE the pop.
+//
+// THE CHECK ITSELF IS PURE, DELIBERATELY. It mutates nothing, so a refusal leaves
+// the standby exactly where it was — and the pop's slice arithmetic, captured
+// before the check, stays valid whatever the call site does next. Funding is the
+// CALL SITE's job (see acquire): on RefuseMemoryBudget it evicts other runs'
+// standbys via evictForPromotionLocked — which needs only perVM minus this
+// standby's dirty charge of headroom, an amount other runs' dirty charges can
+// cover — and re-checks. Keeping the eviction out of this function is what keeps
+// the promoting run's own standbys out of the victim set: the run is not busy yet
+// at first promotion (inFlight is incremented only after the pop), so an evicting
+// variant could hand the very standby being promoted to reclaimQ out from under
+// the caller.
+//
+// A promotion is REFUSED, not evicted-forever, when eviction cannot fund it: no
+// idle standbys elsewhere, or a running set already so close to the budget that
+// even shedding every standby would not close the gap. On a host sized so that
+// slots x PerVMBytes fits the budget — the arithmetic slotBudgetWarning warns
+// about at startup — neither ever fires: admissions alone cannot take the running
+// component to the budget, so no promotion can either. They fire only on a
+// mis-sized or standby-saturated host, where a failed exec is the correct
+// alternative to the OOM killer arbitrating (spec §6).
+func (p *pool) admitPromotionLocked(vm VM) error {
+	if err := p.hostFloorLocked(); err != nil {
+		return err
+	}
+	budget := p.cfg.MaxCommittedBytes - p.cfg.MemoryReserveBytes
+	// committedLocked already books vm at its dirty-page charge; replace that with
+	// the full price it is one Resume away from costing.
+	standby := p.standbyChargeLocked(vm)
+	if next := p.committedLocked() - standby + p.perVMBytes(); next > budget {
+		return refusal(RefuseMemoryBudget,
+			"promoting a standby would re-price it from %d to %d committed bytes, reaching %d "+
+				"against a budget of %d (MaxCommittedBytes %d less MemoryReserveBytes %d): the "+
+				"running set is at the memory ceiling. WORKER_MAX_CONCURRENT x PerVMBytes must fit "+
+				"the budget, or warm acquires fail as the slot count fills",
+			standby, p.perVMBytes(), next, budget, p.cfg.MaxCommittedBytes, p.cfg.MemoryReserveBytes)
+	}
+	return nil
+}
+
+// hostFloorLocked is #644's host backstop: an opt-in floor on the host's own
+// MemAvailable, checked beside the budget arithmetic so that dirty-page accounting
+// is never the only protection between the pool and the OOM killer. Off unless
+// Config.HostMemFloorBytes is set.
+//
+// Reads the ~100ms cache (hostmem.go), not the file: this runs under p.mu on every
+// admission and warm acquire, and MemAvailable does not move fast enough for the
+// staleness to matter to a backstop.
+//
+// FAILS CLOSED on an unreadable /proc/meminfo: "cannot tell" is not "plenty" (the
+// same posture cgroupPool.release takes), and a backstop that silently disables
+// itself on the one host where its input is broken is not a backstop. On a host
+// with no /proc/meminfo at all the operator has no business configuring a
+// MemAvailable floor, which is why this is opt-in rather than defaulted.
+//
+// Refuses with RefuseHostMemory, DISTINCT from RefuseMemoryBudget (spec §6's
+// requirement that refusal causes stay separable): a budget refusal means the
+// operator sized SH_MAX_COMMITTED_MB wrong, a host-floor refusal means the host is
+// genuinely running out — different knobs, different diagnoses, and AM6's ladder
+// needs to tell them apart at the stopping rung.
+func (p *pool) hostFloorLocked() error {
+	if p.cfg.HostMemFloorBytes <= 0 {
+		return nil
+	}
+	avail, err := cachedMemAvailable()
+	if err != nil {
+		return refusal(RefuseHostMemory,
+			"host memory floor is %d MiB but MemAvailable is unreadable: %v — refusing rather "+
+				"than admitting blind (set HostMemFloorBytes to 0 to disable the backstop)",
+			p.cfg.HostMemFloorBytes>>20, err)
+	}
+	if avail < p.cfg.HostMemFloorBytes {
+		return refusal(RefuseHostMemory,
+			"host MemAvailable is %d MiB, below the %d MiB floor (HostMemFloorBytes): the host "+
+				"is running out of memory regardless of the pool's budget arithmetic",
+			avail>>20, p.cfg.HostMemFloorBytes>>20)
 	}
 	return nil
 }
@@ -192,19 +376,104 @@ func (p *pool) unparkedRunsLocked() int {
 	return n
 }
 
-// committedLocked is every VM this host is holding, in bytes. Caller holds p.mu.
+// committedLocked is every VM this host is holding, in bytes, SPLIT BY STATE (#644).
 //
-// Standbys are charged their FULL guest RAM even though they are paused and their
-// memory files are CoW-shared, because a standby is one Resume away from consuming
-// all of it. Admission control that charged the paused footprint would admit a host
-// it cannot then run — the opposite of the PSS-vs-RSS error in spec §7.3, and in the
-// dangerous direction rather than the pessimistic one.
+// RUNNING AND WARMING VMs are charged their full PerVMBytes: a VM that is
+// executing, or restoring in order to execute, is one Resume away from its whole
+// guest RAM and is priced accordingly. Their total is bounded twice over — by this
+// gate and by admitPromotionLocked — so the running component can never exceed the
+// budget, which is what makes the paused component's cheaper charge safe.
+//
+// PAUSED STANDBYS are charged at DIRTY-PAGE COST (standbyChargeLocked): their
+// measured per-VM cgroup memory.current times StandbyHeadroom. Until #644 they
+// were charged their FULL guest RAM — the position the comment here used to defend
+// ("a standby is one Resume away from consuming all of it") — and that full-RAM
+// booking was the density ceiling on the SBX0 shape (4 GiB guests, D=2, 172 GiB
+// budget: ~14-22 concurrent sandboxes on a host that was nearly idle). E11 sampled
+// 306 per-VM cgroups at 0.9 MiB mean / 2 MiB max against a 288 MiB limit — 144x
+// below the charge — because every VM COW-shares one page-cache-resident memfile;
+// AM6 stopped every microVM ladder rung on RefuseMemoryBudget with 150-178 GiB of
+// 188 still free. The full-RAM charge double-counted a hazard the slot count
+// already bounds: only WORKER_MAX_CONCURRENT VMs can run at any moment, and the
+// one-Resume-away hazard is now paid at the right moment — admitPromotionLocked
+// re-prices a standby at PerVMBytes at pop time. What dirty-page charging buys is
+// that the ~99% of a standby's booking that is CoW-shared page cache stops
+// consuming budget no running VM will ever claim; a standby over budget is now
+// something eviction can shed (evictForBudgetLocked) rather than a refusal.
+//
+// WARMING IS CHARGED FULL, STANDBY-DESTINED OR NOT, deliberately diverging from
+// #644's sketch (which lumps warming into the dirty component). A warming VM has
+// no footprint to read at the moment admitLocked prices it — its cgroup exists
+// and is empty — and rp.warming does not distinguish a replenishment that will
+// park from a cold acquire that will run. Charging both at full price is
+// pessimistic only for the 10-25 ms of the restore, and self-limiting in the
+// right direction: a host too full to promote a standby is too full to be
+// building one. It also keeps the warming -> inFlight handoff in acquire
+// charge-neutral, exactly as before.
 func (p *pool) committedLocked() int64 {
+	return p.runningCommittedLocked() + p.standbyCommittedLocked()
+}
+
+// runningCommittedLocked is the full-price component of committedLocked: every VM
+// that is executing or restoring, at PerVMBytes each. Caller holds p.mu.
+func (p *pool) runningCommittedLocked() int64 {
 	var vms int64
 	for _, rp := range p.runs {
-		vms += int64(len(rp.ready) + rp.inFlight + rp.warming)
+		vms += int64(rp.inFlight + rp.warming)
 	}
 	return vms * p.perVMBytes()
+}
+
+// standbyCommittedLocked is the paused component of committedLocked: every ready
+// standby at its dirty-page charge. Caller holds p.mu.
+func (p *pool) standbyCommittedLocked() int64 {
+	var total int64
+	for _, rp := range p.runs {
+		for _, vm := range rp.ready {
+			total += p.standbyChargeLocked(vm)
+		}
+	}
+	return total
+}
+
+// standbyChargeLocked is what one paused standby costs the budget: its measured
+// dirty-page footprint times StandbyHeadroom, floored at VMOverheadBytes and
+// capped at PerVMBytes. Caller holds p.mu.
+//
+// THE FLOOR is VMOverheadBytes because a live VMM and its sidecar are always
+// resident somewhere in the cgroup's charge, so an honest read cannot be smaller —
+// and treating a smaller read as free is the one direction this arithmetic must
+// not err in. THE CAP mirrors the per-VM cgroup memory.max both launchers set from
+// this same PerVMBytes (spec §5.3's one-number rule), so the charge can never
+// exceed what the kernel would let the VM physically take anyway.
+//
+// A VM that cannot report a footprint — the fake launcher, no ParentCgroup, an
+// unreadable cgroup — is charged its FULL PerVMBytes: "cannot tell" is not
+// "cheap", the same posture cgroupPool.release takes. This is also the escape
+// hatch: SH_STANDBY_HEADROOM=full pins every standby at the pre-#644 price.
+func (p *pool) standbyChargeLocked(vm VM) int64 {
+	perVM := p.perVMBytes()
+	if math.IsInf(p.cfg.StandbyHeadroom, 1) {
+		return perVM
+	}
+	sf, ok := vm.(standbyFootprinter)
+	if !ok {
+		return perVM
+	}
+	dirty, err := sf.StandbyBytes()
+	if err != nil || dirty <= 0 {
+		return perVM
+	}
+	// Scaled and clamped in float64 BEFORE the conversion, so a large-but-finite
+	// headroom cannot overflow int64 arithmetic on its way to the cap.
+	scaled := float64(dirty) * p.cfg.StandbyHeadroom
+	if scaled >= float64(perVM) {
+		return perVM
+	}
+	if charge := int64(scaled); charge > p.cfg.VMOverheadBytes {
+		return charge
+	}
+	return p.cfg.VMOverheadBytes
 }
 
 // countRefusal records an already-built refusal and returns it unchanged, so the

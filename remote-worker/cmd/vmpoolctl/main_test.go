@@ -371,3 +371,58 @@ func TestEveryRecordCarriesItsSubstrate(t *testing.T) {
 		}
 	}
 }
+
+// TestTheRecordCarriesTheResolvedStandbyHeadroom pins the #644-review fix: the
+// run record must carry the RESOLVED charge model, not the raw flag. vmpool.New
+// normalizes its own by-value copy of the config, so before the local Normalize
+// the default run recorded standby_headroom=0 — a value ambiguous between "the
+// default 4" and "unset", and useless as the rung's durable trace of which
+// charge priced its standbys.
+func TestTheRecordCarriesTheResolvedStandbyHeadroom(t *testing.T) {
+	dir := t.TempDir()
+	out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-a", "--json", "--", "true")
+	if err != nil {
+		t.Fatalf("realMain: %v (out=%s)", err, out)
+	}
+	var rec runResult
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); err != nil {
+		t.Fatalf("output is not one JSON record: %v\n%s", err, out)
+	}
+	if rec.StandbyHeadroom != vmpool.DefaultStandbyHeadroom {
+		t.Fatalf("StandbyHeadroom = %v, want the resolved default %v — a record of 0 is ambiguous between default and unset",
+			rec.StandbyHeadroom, vmpool.DefaultStandbyHeadroom)
+	}
+	// An explicit finite value survives verbatim.
+	out, err = run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-b", "--standby-headroom=2.5", "--json", "--", "true")
+	if err != nil {
+		t.Fatalf("realMain with --standby-headroom=2.5: %v (out=%s)", err, out)
+	}
+	rec = runResult{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); err != nil {
+		t.Fatalf("output is not one JSON record: %v\n%s", err, out)
+	}
+	if rec.StandbyHeadroom != 2.5 {
+		t.Fatalf("StandbyHeadroom = %v, want 2.5", rec.StandbyHeadroom)
+	}
+}
+
+// TestNonFiniteStandbyHeadroomIsRefused: ParseFloat happily accepts "inf", but
+// json.Encoder cannot encode +Inf ("unsupported value"), so a run that reached
+// the record with it would lose the record wholesale. Refused at flag validation
+// instead; the pre-#644 full-RAM charge remains reachable with a large finite
+// value.
+func TestNonFiniteStandbyHeadroomIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	for _, bad := range []string{"inf", "-inf", "NaN"} {
+		out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+			"--key=run-a", "--standby-headroom="+bad, "--json", "--", "true")
+		if err == nil {
+			t.Fatalf("--standby-headroom=%s was accepted (out=%s) — the record it produces cannot be JSON-encoded", bad, out)
+		}
+		if !strings.Contains(err.Error(), "--standby-headroom") {
+			t.Fatalf("--standby-headroom=%s: error %v does not name the flag", bad, err)
+		}
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,6 +38,63 @@ func TestPoolConfigFromEnvironment(t *testing.T) {
 	if cfg.MaxRuns != 48 || cfg.MaxCommittedBytes != 20480<<20 || cfg.MemoryReserveBytes != 2048<<20 {
 		t.Fatalf("cfg = %+v", cfg)
 	}
+}
+
+// TestPoolConfigReadsThe644Knobs: SH_STANDBY_HEADROOM accepts "full" (the pre-#644
+// full-RAM charge, +Inf) or a number >= 1, and SH_HOST_MEM_FLOOR_MB an optional
+// byte floor from MiB. Both are #644's operator surface, and both must refuse a
+// value they cannot honour rather than silently running at a default — the same
+// posture as WORKER_MAX_CONCURRENT.
+func TestPoolConfigReadsThe644Knobs(t *testing.T) {
+	base := map[string]string{
+		"SH_VMM":              "firecracker",
+		"SH_SNAPSHOT_DIR":     "/srv/snapshots",
+		"SH_WORKSPACE_ROOT":   "/srv/workspaces",
+		"SH_MAX_COMMITTED_MB": "20480",
+	}
+	for _, tc := range []struct {
+		name     string
+		env      map[string]string
+		headroom float64
+		floor    int64
+	}{
+		{"unset leaves both to the defaults", base, 0, 0},
+		{"full restores the legacy charge", with(base, "SH_STANDBY_HEADROOM", "full"), math.Inf(1), 0},
+		{"numeric headroom", with(base, "SH_STANDBY_HEADROOM", "2.5"), 2.5, 0},
+		{"mem floor", with(base, "SH_HOST_MEM_FLOOR_MB", "4096"), 0, 4096 << 20},
+		{"both", with(with(base, "SH_STANDBY_HEADROOM", "8"), "SH_HOST_MEM_FLOOR_MB", "512"), 8, 512 << 20},
+	} {
+		cfg, err := poolConfig(envFrom(tc.env))
+		if err != nil {
+			t.Fatalf("%s: poolConfig: %v", tc.name, err)
+		}
+		if cfg.StandbyHeadroom != tc.headroom {
+			t.Errorf("%s: StandbyHeadroom = %v, want %v", tc.name, cfg.StandbyHeadroom, tc.headroom)
+		}
+		if cfg.HostMemFloorBytes != tc.floor {
+			t.Errorf("%s: HostMemFloorBytes = %d, want %d", tc.name, cfg.HostMemFloorBytes, tc.floor)
+		}
+	}
+	// An empty value is "unset" by this file's env() convention, so it is not in the
+	// refusal list — everything here is a value the operator clearly meant to set.
+	for _, bad := range []string{"0.5", "-1", "abc"} {
+		if _, err := poolConfig(envFrom(with(base, "SH_STANDBY_HEADROOM", bad))); err == nil {
+			t.Fatalf("SH_STANDBY_HEADROOM=%q was accepted; it must refuse", bad)
+		}
+	}
+	if _, err := poolConfig(envFrom(with(base, "SH_HOST_MEM_FLOOR_MB", "0"))); err == nil {
+		t.Fatal("SH_HOST_MEM_FLOOR_MB=0 was accepted; envInt64 refuses non-positive values")
+	}
+}
+
+// with returns a copy of m carrying k=v, so the table above stays declarative.
+func with(m map[string]string, k, v string) map[string]string {
+	out := make(map[string]string, len(m)+1)
+	for key, val := range m {
+		out[key] = val
+	}
+	out[k] = v
+	return out
 }
 
 // Spec §6: "KVM unavailable at startup ... Fail the unit at start with an explicit
@@ -348,27 +406,29 @@ func TestWorkerMaxConcurrentRefusesAMalformedValueInsteadOfSilentlyUsingTheDefau
 	}
 }
 
-// #313 review. Raising the slot count multiplies VM commitment, not just stream buffers:
-// committedLocked sums ready+inFlight+warming across run pools and StandbyDepth is per RUN
-// KEY, so N slots with distinct workspace keys commit up to N x (1 + D) VMs. Overflow
-// returns RefuseMemoryBudget, which budget.go records as reaching the harness "as a failed
-// exec rather than as back-pressure" -- so an operator who sized SH_MAX_COMMITTED_MB for 4
-// slots must be told at startup, not discover it as exec errors under load.
+// #313 review, updated by #644. The slot count's arithmetic is now the RUNNING
+// component of the admission charge — N slots x PerVMBytes — because paused
+// standbys are charged at dirty-page cost and evict rather than fail. Since #644
+// the pool re-prices a standby at full cost when it is popped (admitPromotionLocked),
+// so a host whose slots x PerVMBytes outrun the budget refuses warm acquires —
+// failed execs — as the slot count fills, and an operator who sized
+// SH_MAX_COMMITTED_MB for fewer slots must be told at startup, not discover it as
+// exec errors under load.
 func TestSlotBudgetWarningFiresOnlyWhenTheSlotCountOutrunsTheBudget(t *testing.T) {
-	// 256 MiB guest + 32 MiB overhead = 288 MiB per VM; D=2 so each slot can hold 3.
+	// 256 MiB guest + 32 MiB overhead = 288 MiB per VM.
 	base := vmpool.Config{
 		VMM: vmpool.Firecracker, SnapshotDir: "/srv/snapshots", WorkspaceRoot: "/srv/workspaces",
 		GuestRAMBytes: 256 << 20, StandbyDepth: 2, MaxRuns: 64,
 	}
 
-	// The shipped unit's 24576 MiB funds 85 VMs; 16 slots need 48. Silent.
+	// The shipped unit's 24576 MiB funds 85 running VMs; 16 slots need 16. Silent.
 	fits := base
 	fits.MaxCommittedBytes = 24576 << 20
 	if w := slotBudgetWarning(fits, 16); w != "" {
 		t.Fatalf("16 slots inside the shipped budget must not warn, got: %s", w)
 	}
 
-	// An operator-sized dev box: 2048 MiB funds 7 VMs, and 16 slots can want 48.
+	// An operator-sized dev box: 2048 MiB funds 7 running VMs, and 16 slots want 16.
 	tight := base
 	tight.MaxCommittedBytes = 2048 << 20
 	w := slotBudgetWarning(tight, 16)
@@ -376,16 +436,16 @@ func TestSlotBudgetWarningFiresOnlyWhenTheSlotCountOutrunsTheBudget(t *testing.T
 		t.Fatal("16 slots against a 2048 MiB budget must warn: the overflow arrives as failed Execs")
 	}
 	// The numbers an operator needs to act are the point of the message, not the wording.
-	for _, want := range []string{"16 concurrency slots", "48 VMs", "13824 MiB", "2048 MiB", "WORKER_MAX_CONCURRENT"} {
+	for _, want := range []string{"16 concurrency slots", "4608 MiB", "2048 MiB", "WORKER_MAX_CONCURRENT"} {
 		if !strings.Contains(w, want) {
 			t.Errorf("warning omits %q, so it cannot be acted on: %s", want, w)
 		}
 	}
 
 	// Non-vacuousness for the budget arithmetic: the SAME tight budget is fine at 4 slots
-	// (12 VMs, 3456 MiB)... still over 2048, so use a budget that funds 4 but not 16.
+	// (1152 MiB)... still over 2048, so use a budget that funds 4 but not 16.
 	mid := base
-	mid.MaxCommittedBytes = 4096 << 20 // 14 VMs: covers 4 slots (12), not 16 (48)
+	mid.MaxCommittedBytes = 4096 << 20 // 14 running VMs: covers 4 slots, not 16
 	if w := slotBudgetWarning(mid, 4); w != "" {
 		t.Fatalf("4 slots inside a 4096 MiB budget must not warn, got: %s", w)
 	}
@@ -398,6 +458,21 @@ func TestSlotBudgetWarningFiresOnlyWhenTheSlotCountOutrunsTheBudget(t *testing.T
 	reserved.MemoryReserveBytes = 24000 << 20
 	if slotBudgetWarning(reserved, 16) == "" {
 		t.Fatal("the reserve must be subtracted from the budget before comparing")
+	}
+}
+
+// TestStandbyHeadroomLabel: the banner spells +Inf as "full" and resolves the
+// unset 0 to the default, because a rung record is not readable without knowing
+// which charge model priced its standbys (#644).
+func TestStandbyHeadroomLabel(t *testing.T) {
+	if got := standbyHeadroomLabel(vmpool.Config{}); got != "4" {
+		t.Fatalf("label for unset headroom = %q, want the resolved default \"4\"", got)
+	}
+	if got := standbyHeadroomLabel(vmpool.Config{StandbyHeadroom: 2.5}); got != "2.5" {
+		t.Fatalf("label for 2.5 = %q, want \"2.5\"", got)
+	}
+	if got := standbyHeadroomLabel(vmpool.Config{StandbyHeadroom: math.Inf(1)}); got != "full" {
+		t.Fatalf("label for +Inf = %q, want \"full\"", got)
 	}
 }
 

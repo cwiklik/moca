@@ -916,6 +916,38 @@ type firecrackerVM struct {
 	// Resume and read by ResumePhases, both under mu: Resume runs on the Exec's
 	// goroutine while the deferred reaper may be touching this same VM's mu.
 	phVMResume, phVsockDial, phMount time.Duration
+
+	// The standby footprint (#644): this VM's pooled-cgroup memory.current, read
+	// ONCE on the first StandbyBytes call and cached, error included — a failed
+	// read pins the full-PerVMBytes charge rather than retrying a broken cgroup on
+	// every admission check. All under mu. Paused VMs only: a VM that has Resumed
+	// is inFlight and full-price, and nobody asks it again.
+	standbyFootprint    int64
+	standbyFootprintErr error
+	standbyFootprintSet bool
+}
+
+// StandbyBytes implements standbyFootprinter (budget.go): this paused VM's
+// dirty-page cost, from its pooled cgroup's memory.current.
+//
+// CACHED ON FIRST READ because the read is what admission control does per check
+// and a paused VM's footprint is static: its vcpus are stopped, so nothing inside
+// it can dirty another page between the read and the promotion that re-prices it
+// at full PerVMBytes anyway. One cgroupfs syscall per standby per lifetime instead
+// of one per admission.
+func (v *firecrackerVM) StandbyBytes() (int64, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.standbyFootprintSet {
+		return v.standbyFootprint, v.standbyFootprintErr
+	}
+	v.standbyFootprintSet = true
+	if v.cgroups == nil || v.cgroupRel == "" {
+		v.standbyFootprintErr = fmt.Errorf("firecracker VM %s: no pooled cgroup to read (ParentCgroup unset?)", v.id)
+		return 0, v.standbyFootprintErr
+	}
+	v.standbyFootprint, v.standbyFootprintErr = readMemoryCurrent(v.cgroups.abs(v.cgroupRel))
+	return v.standbyFootprint, v.standbyFootprintErr
 }
 
 // ResumePhases implements resumePhaser (diag.go). Zero until the first Resume.
