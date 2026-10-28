@@ -95,7 +95,10 @@ case "$cmd" in
 credentials)
   # credentials add NAME --preset P (the PAT on stdin, never logged) / credentials delete NAME
   case "${args[0]}" in
-  add) cat >"$MOCK_DIR/cred-${args[1]}"; echo "$user" >"$MOCK_DIR/cred-${args[1]}.owner" ;;
+  # .read keeps the bytes exactly as they arrived on stdin, and the delete below leaves it behind,
+  # so a test can still see what the add was given after the run has revoked the credential.
+  add) cat >"$MOCK_DIR/cred-${args[1]}"; cp "$MOCK_DIR/cred-${args[1]}" "$MOCK_DIR/cred-${args[1]}.read"
+    echo "$user" >"$MOCK_DIR/cred-${args[1]}.owner" ;;
   delete)
     [[ -f "$MOCK_DIR/cred-${args[1]}" ]] || { echo 'sbx: no such credential' >&2; exit 1; }
     rm -f "$MOCK_DIR/cred-${args[1]}"
@@ -297,6 +300,7 @@ BASEPATH="$PATH"
 export PATH="$TMP/bin:$BASEPATH"
 
 reset_state() {
+  # cred-* takes the .read and .owner side files with it.
   rm -rf "$MOCK_DIR"/cred-* "$MOCK_DIR/remote-branches" "$MOCK_DIR/sb" "$MOCK_DIR/n" "$MOCK_DIR/names" "$MOCK_DIR/rm-failed" "$MOCK_SRV/workspaces/sbx_default" "$TMP"/home-?/.local
   mkdir -p "$MOCK_DIR/sb" "$MOCK_SRV/workspaces/sbx_default"
   # A sandbox of user A's that this run did not create: it must outlive every run.
@@ -532,11 +536,36 @@ pass "a step whose own sbx rm fails is not ok, and the trap still deletes the sa
 
 # 10. Step 7, egress credentials: opt-in; user A only unless asked for B.
 # The PAT never reaches argv (the mocactl and curl logs) nor any output line, in any of these runs.
+# kept_logs prints the directory a failed run left behind, from the one place that names it
+# (smoke.sh's cleanup: `# logs kept in DIR`). A run that passed removes it and prints no such line.
+kept_logs() { sed -n 's/^# logs kept in //p' "$TMP/out"; }
 nopat() {
   hasnt "$PAT"
   ! grep -qF -- "$PAT" "$MOCK_LOG" || fail 'the PAT is in a logged argv'
   ! grep -qF -- "${PAT#ghp_}" "$MOCK_LOG" "$TMP/out" || fail 'part of the PAT is in the log or the output'
-  if [[ -d "${LOGS_KEPT:-}" ]]; then ! grep -rqF -- "$PAT" "$LOGS_KEPT" || fail 'the PAT is in the kept logs'; fi
+  # The command output of a failed run is kept for the operator to read, so it is a place the PAT
+  # can leak to that outlives the run. Checked per directory named, not through a variable nothing
+  # sets: an unset one made this assertion a no-op for the whole of SBX0.2b.
+  local d
+  while read -r d; do
+    [[ -d "$d" ]] || fail "smoke.sh said it kept logs in '$d', which is not a directory"
+    ! grep -rqF -- "$PAT" "$d" || fail "the PAT is in the kept logs ($d)"
+    ! grep -rqF -- "${PAT#ghp_}" "$d" || fail "part of the PAT is in the kept logs ($d)"
+  done < <(kept_logs)
+}
+# nopat is only as strong as the files it reaches, so pin that it reaches them: a PAT planted in a
+# kept log must make it fail. Without this, a kept-logs path that stops resolving goes unnoticed.
+nopat_sees_kept_logs() {
+  local d
+  d="$(kept_logs | head -n 1)"
+  [[ -n "$d" && -d "$d" ]] || fail 'the failing run kept no logs: nopat has no kept logs to check'
+  printf '%s\n' "$PAT" >"$d/canary.log"
+  if (nopat) 2>/dev/null; then
+    rm -f "$d/canary.log"
+    fail 'nopat passed with the PAT planted in the kept logs: the kept-logs check is a no-op'
+  fi
+  rm -f "$d/canary.log"
+  nopat
 }
 credrun() { smoke SBX_SMOKE_STEPS=7 -u SBX_SMOKE_HOME_B SBX_SMOKE_GITHUB_TOKEN_FILE="$TMP/pat" SBX_SMOKE_GITHUB_REPO=octo/repo "$@"; }
 
@@ -573,8 +602,16 @@ grep -qx 'gh api user --jq .login' "$MOCK_LOG" || fail 'no gh api user'
 [[ ! -e "$MOCK_DIR/cred-smoke-gh" ]] || fail 'the credential was left'
 # The wait: TTL 60 + 5 s on the fake clock, between the delete and the check.
 grep -q 'waiting 65 s' "$TMP/out" || fail 'no 65 s wait'
-# The credential add reads the PAT from the file on stdin (the fake keeps what it read).
-[[ "$(cat "$MOCK_DIR/cred-smoke-gh" 2>/dev/null || true)" == '' ]] || true
+# The add is handed the token file on stdin, byte for byte, and the PAT reaches it no other way.
+# (Dropping the trailing newline is mocactl's own contract, not the smoke's: it pipes the file
+# whole, so what the fake receives still has it.) The credential is gone by here, deleted above,
+# so this reads what the fake kept of that stdin. The `|| true` this replaces compared the
+# already-deleted file against '' and discarded the result either way, so it held nothing at all:
+# the smoke could have sent an empty stdin, or the PAT on argv, and it would still have passed.
+[[ -f "$MOCK_DIR/cred-smoke-gh.read" ]] || fail 'the credential add never read the PAT from stdin'
+cmp -s "$MOCK_DIR/cred-smoke-gh.read" "$TMP/pat" ||
+  fail "the add's stdin is not the token file: $(cmp "$MOCK_DIR/cred-smoke-gh.read" "$TMP/pat" 2>&1 |
+    sed 's/^cmp: //')"
 nopat
 pass 'step 7: store on stdin, clone/commit/push, the owner, the branch deleted, the placeholder 401, revoked; PAT in no log or output'
 
@@ -623,6 +660,8 @@ credfail() { # credfail WHY ENV...
 credfail 'is not the PAT.s owner' MOCK_GH_WRONG=1
 grep -q '^# cleanup: deleted credential smoke-gh (user A)$' "$TMP/out" || fail 'the trap did not delete the credential'
 grep -q '^# cleanup: deleted remote branch sbx-smoke-' "$TMP/out" || fail 'the trap did not delete the branch'
+# A failed run is the case that keeps its logs, so it is the one that can prove nopat reads them.
+nopat_sees_kept_logs
 credfail 'got .200., not 401\|got .200. from api.github.com/user' MOCK_PLACEHOLDER_OK=1
 credfail 'after the delete and 65 s the sandbox got' MOCK_CRED_STALE=1
 credfail 'sbx credentials add smoke-gh --preset github' MOCK_FAIL=add
