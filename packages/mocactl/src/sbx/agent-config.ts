@@ -29,8 +29,9 @@ import {
 } from './json-edit.js';
 
 /**
- * The agent configuration `sbx up` writes (SBX0 spec §6.3): Claude Code and OpenCode pointed at the
- * sandbox MCP server, with every local built-in tool that would act on the laptop denied.
+ * The agent configuration `sbx up` writes (SBX0 spec §6.3): Claude Code, OpenCode and IBM Bob
+ * pointed at the sandbox MCP server, with every local built-in tool that would act on the laptop
+ * denied — except Bob's, which has no deny mechanism to use (see BOB_SERVER).
  *
  * It is MERGED into what the developer has and never overwrites: a key is added, an array item
  * appended, a Markdown block put between markers; a value already there that disagrees stops
@@ -1205,7 +1206,7 @@ export function takeBackAgentConfig(root: string): TakeBack {
   const files = uniq(m.json.map((r) => r.file));
   const docs: Doc[] = [];
   // A record names a file after following links (target()), so a linked opencode.json is recorded
-  // as its target's path. Only Claude Code's two files are strict JSON: decide by resolving them.
+  // as its target's path. Only OpenCode's is JSONC; the rest are strict JSON: decide by resolving.
   const strict = new Set<string>();
   for (const f of [MCP_JSON, SETTINGS, BOB_SETTINGS]) {
     try {

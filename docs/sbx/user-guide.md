@@ -584,7 +584,7 @@ mocactl sbx doctor
 ```
 ok - login: logged in to https://<api host> as <your GitHub login>
 ok - sandbox: sbx-0f3a9c2e7b1d4a5f6e8c0b2d4a (default) is ready; expires 2026-10-26T09:00:00.000Z, in 6 d 23 h
-ok - agent config: Claude Code and OpenCode use the sandbox MCP server, with every local tool denied in this repository's project config; user-level and managed settings are not checked
+ok - agent config: Claude Code, OpenCode and IBM Bob use the sandbox MCP server, with every local tool denied in this repository's project config except Bob's, which it has no way to deny; user-level and managed settings are not checked
 ok - exec: one `true` in a fresh VM: 412 ms
 ok - changes: nothing to pull
 ok - recent calls: 42 calls in the last 24 h: p50 380 ms, p95 1210 ms, 1 error (0 not the command's own)
@@ -592,14 +592,14 @@ ok - recent calls: 42 calls in the last 24 h: p50 380 ms, p95 1210 ms, 1 error (
 
 It exits 0 when every check passes, else 1, and each failure prints its fix. What they mean:
 
-| Check          | A failure means                                                                                                                                                                                                                                                               |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `login`        | Not logged in (run `mocactl sbx login`), not enrolled (send your operator the `github:<id>` it names), or the service is unreachable (check the URL and your network)                                                                                                         |
-| `sandbox`      | No sandbox is bound here, it no longer exists, or it is terminated (deleted or expired): `mocactl sbx up` creates a new one. "less than 24 h left": pull its work now                                                                                                         |
-| `agent config` | A local tool is enabled again, or the `sandbox` server is missing, in this repository's project files: `mocactl sbx up` merges it again. It checks the project's files only, not your user-level or managed settings; a local tool you enable there still acts on your laptop |
-| `claude code`  | Shown only when it fails: the Claude Code on your `PATH` is older than 2.0.0, so its `MultiEdit`, `LS` and `NotebookRead` tools read or edit files on your laptop and are not denied. Run `claude update`                                                                     |
-| `exec`         | The sandbox does not answer. Retry in a minute; if it persists, tell your operator (`mocactl sbx doctor --json` is what to send)                                                                                                                                              |
-| `changes`      | A warning, not a failure: the sandbox holds work you have not pulled (`mocactl sbx pull --apply`), or the last push did not finish (`mocactl sbx push`)                                                                                                                       |
+| Check          | A failure means                                                                                                                                                                                                                                                                                                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `login`        | Not logged in (run `mocactl sbx login`), not enrolled (send your operator the `github:<id>` it names), or the service is unreachable (check the URL and your network)                                                                                                                                                                                          |
+| `sandbox`      | No sandbox is bound here, it no longer exists, or it is terminated (deleted or expired): `mocactl sbx up` creates a new one. "less than 24 h left": pull its work now                                                                                                                                                                                          |
+| `agent config` | A local tool is enabled again, or the `sandbox` server is missing, in this repository's project files: `mocactl sbx up` merges it again. For IBM Bob it checks only that the server is there, since Bob has no deny list. It checks the project's files only, not your user-level or managed settings; a local tool you enable there still acts on your laptop |
+| `claude code`  | Shown only when it fails: the Claude Code on your `PATH` is older than 2.0.0, so its `MultiEdit`, `LS` and `NotebookRead` tools read or edit files on your laptop and are not denied. Run `claude update`                                                                                                                                                      |
+| `exec`         | The sandbox does not answer. Retry in a minute; if it persists, tell your operator (`mocactl sbx doctor --json` is what to send)                                                                                                                                                                                                                               |
+| `changes`      | A warning, not a failure: the sandbox holds work you have not pulled (`mocactl sbx pull --apply`), or the last push did not finish (`mocactl sbx push`)                                                                                                                                                                                                        |
 
 Other messages:
 
@@ -637,9 +637,10 @@ Other messages:
   [IBM Bob](#ibm-bob) above.
 - **Codex edits files on your laptop instead of in the sandbox**: check you started it with
   `mocactl sbx codex` (or the `-c mcp_servers.sandbox=…` line), and that `/mcp` in the TUI lists
-  the `sandbox` tools. Note `mocactl sbx doctor`'s `agent config` check covers Claude Code and
-  OpenCode only: Codex has nothing in your repository for it to check, and its `unified_exec` tool
-  cannot be disabled, so add `-c sandbox_mode="read-only"` if you want its own confinement too.
+  the `sandbox` tools. Note `mocactl sbx doctor`'s `agent config` check covers Claude Code,
+  OpenCode and IBM Bob (for Bob, only that the server is there), but not Codex: Codex has nothing
+  in your repository for it to check, and its `unified_exec` tool cannot be disabled, so add
+  `-c sandbox_mode="read-only"` if you want its own confinement too.
 
 **Logging out.** `mocactl sbx logout` ends this login and deletes `sbx-auth.json` (in
 `~/.config/mocactl/`). It is kept apart from `mocactl login`'s MOCA login: you can have both, and
