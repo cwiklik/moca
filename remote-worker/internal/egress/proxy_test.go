@@ -515,33 +515,35 @@ func TestCapRefusalsAreBoundedPerVM(t *testing.T) {
 	// in flight for drainTimeout -- which is what makes the bound observable.
 	const offered = maxCapRefusalsPerVM * 6
 	peak := 0
-	sample := func(i int) {
+	sample := func(at string) {
 		n := h.capRefusalsInFlight("vm-1")
 		if n > peak {
 			peak = n
 		}
 		if n > maxCapRefusalsPerVM {
-			t.Fatalf("refusal %d: %d in flight, over the bound of %d: a guest can grow host fds without limit",
-				i, n, maxCapRefusalsPerVM)
+			t.Fatalf("%s: %d in flight, over the bound of %d: a guest can grow host fds without limit",
+				at, n, maxCapRefusalsPerVM)
 		}
 	}
 	for i := 0; i < offered; i++ {
 		c := dial(t, path)
 		fmt.Fprintf(c, "CONNECT up.test:%d HTTP/1.1\r\nHost: up.test\r\n\r\n", up.port)
-		sample(i)
+		sample(fmt.Sprintf("refusal %d", i))
 	}
 	// The offer loop never blocks -- the kernel completes the dials into the
 	// listener backlog and the requests fit the socket buffers -- so on a
 	// loaded runner it can finish before the accept goroutine has charged a
 	// single refusal. The backlog still holds the offers, and a charged
-	// refusal stays in flight for ~2*drainTimeout, so wait for the accept
-	// loop to catch up: the bound must hold as the charges land, too.
+	// refusal stays in flight for ~2*drainTimeout, so wait until every offer
+	// has been charged: the bound must hold as they land, too, not only at
+	// the first one the poll happens to see.
 	if peak == 0 {
 		deadline := time.Now().Add(3 * time.Second)
-		for peak == 0 && time.Now().Before(deadline) {
-			sample(offered)
+		for h.capCharged("vm-1") < offered && time.Now().Before(deadline) {
+			sample("catch-up")
 			time.Sleep(2 * time.Millisecond)
 		}
+		sample("catch-up")
 	}
 	if peak == 0 {
 		t.Fatal("no refusal was ever in flight: the test did not exercise the refusal path")
