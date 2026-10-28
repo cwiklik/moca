@@ -177,9 +177,11 @@ const VSCODE_FILES: Record<string, string> = {
 /**
  * The prompt files an agent reads: warned about, not refused (they are text, not executables).
  * `AGENTS.override.md` is Codex CLI's: it is read in preference to `AGENTS.md`, so a new one
- * silently replaces the instructions an agent session reads (#592).
+ * silently replaces the instructions an agent session reads (#592). `.bobrules` is IBM Bob's own
+ * steering file, which `sbx up` does not write and so holds no `sbx` block: a change to it is all
+ * change, and warned about whole (#657 review).
  */
-const PROMPT_FILES = new Set(['claude.md', 'agents.md', 'agents.override.md']);
+const PROMPT_FILES = new Set(['claude.md', 'agents.md', 'agents.override.md', '.bobrules']);
 
 const foldedIn = (seg: string, names: Record<string, string>): string | undefined =>
   folds(seg)

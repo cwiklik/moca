@@ -267,8 +267,9 @@ each file and why, and nothing is applied. These files can make your laptop run 
 time an agent, an editor, git or direnv starts, and they are often uncommitted, so `git diff` would
 not show the change. To take such a change, save the patch with `mocactl sbx pull -o FILE`, read
 it, and apply what you want by hand (`git apply --exclude=.claude/settings.json FILE` leaves a file
-out). A change to `CLAUDE.md`, `AGENTS.md` or `AGENTS.override.md` outside the `sbx` block is
-applied, with a warning on stderr: review it before your next agent session.
+out). A change to an agent's steering file — `CLAUDE.md`, `AGENTS.md`, `AGENTS.override.md` or
+Bob's `.bobrules` — outside the `sbx` block is applied, with a warning on stderr: review it before
+your next agent session.
 
 ## 4. What `sbx up` changed in your repository
 
