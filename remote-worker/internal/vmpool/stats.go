@@ -14,6 +14,13 @@ type Stats struct {
 	StandbysResident     int   // total paused VMs
 	IdleStandbyResidency int   // standbys of runs idle > StandbyIdle/2 (spec §7.1)
 	CommittedBytes       int64 // what the memory gate is holding against MaxCommittedBytes
+	// StandbyCommittedBytes is the PAUSED component of CommittedBytes (#644): the
+	// dirty-page charge of every ready standby. Reported beside CommittedBytes —
+	// and never instead of it — because only the pair answers the question a
+	// density ladder stops on: was the ceiling the running VMs (a real memory
+	// bound) or the standby booking (bookkeeping)? Running VMs make up the
+	// difference, CommittedBytes - StandbyCommittedBytes, each at full PerVMBytes.
+	StandbyCommittedBytes int64
 
 	WarmAcquires      uint64
 	ColdAcquires      map[ColdCause]uint64

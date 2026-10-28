@@ -1052,6 +1052,10 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		console:   console,
 		chvLog:    chvLogPath,
 		fsConsole: fsConsole,
+		// Empty unless ParentCgroup placed this VM in a systemd scope — see
+		// StandbyBytes. Computed from the SAME three naming authorities the orphan
+		// sweep recognises (cgroup.go's naming block), never retyped inline.
+		scopeCgroup: chvScopeCgroupDir(l.opts.ParentCgroup, req.ID),
 	}, nil
 }
 
@@ -1141,12 +1145,61 @@ type chvVM struct {
 
 	mu        sync.Mutex
 	destroyed bool
+
+	// scopeCgroup is this VM's systemd scope cgroup directory on cgroupfs, empty
+	// when ParentCgroup is unset (nothing placed the VM in a scope, so there is no
+	// footprint to read and standbyChargeLocked charges full price). Used only by
+	// StandbyBytes; guarded by mu alongside the footprint cache below.
+	scopeCgroup string
+	// The standby footprint cache (#644), same shape and same reasoning as
+	// firecrackerVM's: read once on the first StandbyBytes call, error included,
+	// never retried.
+	standbyFootprint    int64
+	standbyFootprintErr error
+	standbyFootprintSet bool
 }
 
 func (v *chvVM) Key() string { return v.key }
 
 // ID is the per-VM id that names the run dir and the scope (read by vmID for the exec audit line).
 func (v *chvVM) ID() string { return v.id }
+
+// chvScopeCgroupDir is the cgroupfs directory systemd materialises for one VM's
+// `systemd-run --scope` unit: Cgroup2Root + the slice-relative ParentCgroup +
+// chvScopeUnitName(vmID) + ".scope". Built from the SAME naming authorities the
+// orphan sweep recognises (cgroup.go's naming block: Cgroup2Root, ParentCgroup,
+// chvScopeUnitName, chvScopeDirSuffix) so the reader and the sweep cannot drift
+// onto different directories — exactly the drift that class of block exists to
+// prevent. Empty when parentCgroup is unset, matching the field's own contract.
+// systemd expands a dashed slice name into a hierarchy, so the two-segment
+// ParentCgroup ("microvm.slice/microvm-vms.slice") is already the full path under
+// the mount; see DefaultParentCgroup's hardware-verified comment.
+func chvScopeCgroupDir(parentCgroup, vmID string) string {
+	if parentCgroup == "" {
+		return ""
+	}
+	return filepath.Join(Cgroup2Root, parentCgroup, chvScopeUnitName(vmID)+chvScopeDirSuffix)
+}
+
+// StandbyBytes implements standbyFootprinter (budget.go): this paused VM's
+// dirty-page cost, read from its systemd scope cgroup's memory.current. Same
+// cache-once reasoning as firecrackerVM.StandbyBytes: a paused VM's footprint is
+// static (vcpus stopped), so the first answer is the answer, and one cgroupfs
+// syscall per standby per lifetime beats one per admission check.
+func (v *chvVM) StandbyBytes() (int64, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.standbyFootprintSet {
+		return v.standbyFootprint, v.standbyFootprintErr
+	}
+	v.standbyFootprintSet = true
+	if v.scopeCgroup == "" {
+		v.standbyFootprintErr = fmt.Errorf("cloud-hypervisor VM %s: no scope cgroup to read (ParentCgroup unset?)", v.id)
+		return 0, v.standbyFootprintErr
+	}
+	v.standbyFootprint, v.standbyFootprintErr = readMemoryCurrent(v.scopeCgroup)
+	return v.standbyFootprint, v.standbyFootprintErr
+}
 
 // Resume unpauses the VM via ch-remote. It does NOT mount the workspace — round 8
 // moved that into Run, deliberately, not as an oversight this comment used to claim

@@ -9,6 +9,7 @@ package vmpool
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -44,6 +45,16 @@ const (
 	// MaxCommittedBytes bounds what the host actually commits — spec §7.3's
 	// "VMs x VMM/virtiofsd overhead" term, which its sketch puts at ~2 GiB of 21.
 	DefaultVMOverheadBytes = 32 << 20
+	// DefaultStandbyHeadroom is the multiplier applied to a paused standby's
+	// MEASURED dirty-page footprint before it is charged to the admission budget
+	// (#644). It prices the footprint's growth between the read and the standby's
+	// eventual promotion (where it is re-priced at full PerVMBytes anyway), plus the
+	// kernel-accounting drift a paused cgroup can still show (slab, per-cgroup
+	// bookkeeping). E11 measured standbys at 0.9 MiB mean / 2 MiB max against a
+	// 288 MiB limit, so against the floor (VMOverheadBytes, 32 MiB) the factor
+	// barely binds on today's shapes — 4 is the conservative end of #644's proposed
+	// 2-4x range, and AM6's re-run of the density ladder is what should pin it.
+	DefaultStandbyHeadroom = 4.0
 )
 
 // Config is the pool's whole configuration surface (spec §4.1).
@@ -66,6 +77,24 @@ type Config struct {
 	MaxCommittedBytes  int64
 	MemoryReserveBytes int64
 	VMOverheadBytes    int64
+
+	// StandbyHeadroom multiplies a paused standby's MEASURED dirty-page footprint
+	// (its per-VM cgroup's memory.current) before charging it to the admission
+	// budget (#644). 0 is filled with DefaultStandbyHeadroom by Normalize.
+	// +Inf — spelled SH_STANDBY_HEADROOM=full at the worker — restores the
+	// pre-#644 behaviour of charging every standby its full PerVMBytes, running
+	// or paused: the floor/cap clamp pins the charge at the PerVMBytes ceiling for
+	// any dirty footprint, which is exactly the legacy number. Kept as a knob so a
+	// suspicion of dirty-page mis-accounting is one env var away from the old
+	// posture, on the same binary.
+	StandbyHeadroom float64
+
+	// HostMemFloorBytes is an opt-in host backstop beside the budget arithmetic
+	// (#644): when > 0, admission also refuses whenever the host's own
+	// MemAvailable (/proc/meminfo) is below it. The budget bounds what VMs may
+	// commit; this bounds what the kernel says is left, so dirty-page accounting
+	// is never the only protection between the pool and the OOM killer. 0 = off.
+	HostMemFloorBytes int64
 
 	StandbyIdle         time.Duration // no Exec for this long -> drop standbys, KEEP workspace
 	WorkspaceIdle       time.Duration // no Exec for this long -> delete the workspace too
@@ -106,6 +135,27 @@ func (c *Config) Normalize() error {
 	// separate default would silently stop tracking a tuned StandbyIdle.
 	if c.ReclaimScanInterval <= 0 {
 		c.ReclaimScanInterval = c.StandbyIdle / 4
+	}
+
+	// StandbyHeadroom: 0 means unset (default); +Inf means "full" (legacy charge);
+	// anything in [1, +Inf) is a multiplier on the measured dirty pages. The
+	// refusal band is (0, 1) exclusive and NaN: a headroom below 1 would charge a
+	// standby LESS than the pages it has already dirtied, which is the one
+	// direction admission control must not err in (spec §6's OOM posture), and NaN
+	// compares false against every bound below so it needs its own rejection.
+	switch {
+	case c.StandbyHeadroom == 0:
+		c.StandbyHeadroom = DefaultStandbyHeadroom
+	case math.IsInf(c.StandbyHeadroom, 1):
+	case c.StandbyHeadroom >= 1:
+	default:
+		return fmt.Errorf("vmpool: StandbyHeadroom (%v) must be >= 1, or +Inf for the pre-#644 full-RAM "+
+			"charge: a smaller factor would charge a standby less than the memory it has already "+
+			"dirtied", c.StandbyHeadroom)
+	}
+	if c.HostMemFloorBytes < 0 {
+		return fmt.Errorf("vmpool: HostMemFloorBytes (%d) must be >= 0 (0 disables the MemAvailable backstop)",
+			c.HostMemFloorBytes)
 	}
 
 	switch c.VMM {

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,21 +47,34 @@ type runResult struct {
 	// many VMs were ever alive at once (SerializesExecsPerRun). A record carrying
 	// concurrency without keys is the one that cannot be read back correctly -- #307's
 	// original table is the worked example.
-	Keys            int               `json:"keys"`
-	WarmupDiscarded int               `json:"warmup_discarded"`
-	Failures        int               `json:"failures"`
-	StandbyDepth    int               `json:"standby_depth"`
-	GuestRAMMB      int64             `json:"guest_ram_mb"`
+	Keys            int   `json:"keys"`
+	WarmupDiscarded int   `json:"warmup_discarded"`
+	Failures        int   `json:"failures"`
+	StandbyDepth    int   `json:"standby_depth"`
+	GuestRAMMB      int64 `json:"guest_ram_mb"`
+	// StandbyHeadroom is recorded (#644) because which charge model priced the
+	// standbys decides what a density number means: 4 is dirty-page cost with the
+	// default headroom, 1e9+ is the pre-#644 full-RAM charge. A rung record
+	// carrying standby_depth without this is ambiguous between the two regimes.
+	// The RESOLVED value (the flag's 0 already turned into the default inside cfg
+	// by the time this is filled), so the record never has to re-derive it.
+	StandbyHeadroom float64           `json:"standby_headroom"`
 	Substrate       string            `json:"substrate"`
 	MemfilePinned   bool              `json:"memfile_pinned"`
 	Limits          map[string]string `json:"limits"`
 	WarmAcquires    uint64            `json:"warm_acquires"`
-	ColdAcquires    map[string]uint64 `json:"cold_acquires"`
-	Refusals        map[string]uint64 `json:"refusals"`
-	P50AcquireUs    int64             `json:"p50_acquire_us"`
-	P95AcquireUs    int64             `json:"p95_acquire_us"`
-	P50ResumeUs     int64             `json:"p50_resume_us"`
-	P95ResumeUs     int64             `json:"p95_resume_us"`
+	BudgetEvictions uint64            `json:"budget_evictions"`
+	// StandbyCommittedBytes is the paused component of the admission charge at
+	// scrape time (#644) — what dirty-page pricing booked the standbys at, beside
+	// --max-committed-mb, so a record says WHICH regime priced it (with
+	// standby_headroom).
+	StandbyCommittedBytes int64             `json:"standby_committed_bytes"`
+	ColdAcquires          map[string]uint64 `json:"cold_acquires"`
+	Refusals              map[string]uint64 `json:"refusals"`
+	P50AcquireUs          int64             `json:"p50_acquire_us"`
+	P95AcquireUs          int64             `json:"p95_acquire_us"`
+	P50ResumeUs           int64             `json:"p50_resume_us"`
+	P95ResumeUs           int64             `json:"p95_resume_us"`
 	// Resume's three sub-phases (Firecracker only; zero on the CHV arm, which has no
 	// workspace mount). They sum to resume_us, which keeps its old meaning so that
 	// earlier campaign tables stay comparable -- see vmpool.Phases.
@@ -111,6 +125,11 @@ func realMain(args []string, stdout io.Writer) error {
 		wsRoot      = fs.String("workspace-root", "", "directory holding per-run workspaces")
 		key         = fs.String("key", "", "workspace_key to run under")
 		depth       = fs.Int("standby-depth", vmpool.DefaultStandbyDepth, "D")
+		headroom    = fs.Float64("standby-headroom", 0,
+			"multiplier on a paused standby's measured dirty-page footprint for the admission "+
+				"budget (#644). 0 means the built-in default ("+strconv.FormatFloat(vmpool.DefaultStandbyHeadroom, 'g', -1, 64)+
+				"); 1e9 or more is effectively the pre-#644 full-RAM charge. Only observable on the real "+
+				"launchers: the fake arm cannot report a footprint and is charged full price")
 		bulkKeys    = fs.Int("bulk-keys", 0, "teardown-bulk only: run pools per batch; 0 derives a batch of MaxReclaimsPerScan VMs")
 		guestMB     = fs.Int64("guest-ram-mb", vmpool.DefaultGuestRAMBytes>>20, "guest RAM per VM, MiB")
 		maxRuns     = fs.Int("max-runs", 64, "MaxRuns backstop")
@@ -281,6 +300,7 @@ func realMain(args []string, stdout io.Writer) error {
 		SnapshotDir:       *snapshotDir,
 		WorkspaceRoot:     *wsRoot,
 		StandbyDepth:      *depth,
+		StandbyHeadroom:   *headroom,
 		GuestRAMBytes:     *guestMB << 20,
 		MaxRuns:           *maxRuns,
 		MaxCommittedBytes: *committedMB << 20,
@@ -313,6 +333,7 @@ func realMain(args []string, stdout io.Writer) error {
 		VMM: *vmm, Host: host, Key: *key, Command: command, Mode: *mode,
 		Iterations: *iterations, Concurrency: *concurrency, Keys: keysUsed(*mode, *keys),
 		StandbyDepth: cfg.StandbyDepth, GuestRAMMB: *guestMB,
+		StandbyHeadroom:  cfg.StandbyHeadroom,
 		Substrate:        *substrate,
 		Limits:           gatherLimits(),
 		DeferReapWorkers: *deferReap,
@@ -381,6 +402,12 @@ func realMain(args []string, stdout io.Writer) error {
 	st := pool.Stats()
 	res.WarmAcquires = st.WarmAcquires
 	res.ReapsInline = st.ReapsInline
+	// BudgetEvictions is the pressure signal that REPLACED refusals for the paused
+	// component (#644): a fan-out past the budget sheds standbys rather than
+	// failing execs, so a rung's pressure now shows here — read it against
+	// Refusals exactly as Stats.BudgetEvictions' doc instructs.
+	res.BudgetEvictions = st.BudgetEvictions
+	res.StandbyCommittedBytes = st.StandbyCommittedBytes
 	res.ColdAcquires = map[string]uint64{}
 	for k, v := range st.ColdAcquires {
 		res.ColdAcquires[string(k)] = v
