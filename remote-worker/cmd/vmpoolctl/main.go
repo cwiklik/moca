@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -191,6 +192,15 @@ func realMain(args []string, stdout io.Writer) error {
 	if *iterations < 1 || *concurrency < 1 {
 		return fmt.Errorf("--iterations and --concurrency must be >= 1")
 	}
+	// Non-finite headroom is refused HERE rather than inside the pool because its
+	// failure mode is silent data loss, not a bad charge: json.Encoder cannot
+	// encode +Inf ("unsupported value"), so a run record carrying it would be lost
+	// wholesale — the record IS the rung's durable trace (#644 review). The
+	// pre-#644 full-RAM charge is reachable with a large finite value, which the
+	// charge's PerVMBytes cap makes numerically equivalent.
+	if math.IsInf(*headroom, 0) || math.IsNaN(*headroom) {
+		return fmt.Errorf("--standby-headroom must be a finite number (use 1e9 or more for the pre-#644 full-RAM charge): %v is not", *headroom)
+	}
 	if *keys < 1 {
 		return fmt.Errorf("--keys must be >= 1")
 	}
@@ -306,6 +316,15 @@ func realMain(args []string, stdout io.Writer) error {
 		MaxCommittedBytes: *committedMB << 20,
 		DeferReapWorkers:  *deferReap,
 		ReplenishDelay:    time.Duration(*replenishMs) * time.Millisecond,
+	}
+	// Normalize the LOCAL copy, not just vmpool.New's: New normalizes its own
+	// by-value copy, so without this the run record would carry the UNRESOLVED
+	// StandbyHeadroom (0 rather than the default 4), and a record claiming
+	// standby_headroom=0 is ambiguous between "default" and "unset" — the record
+	// is the rung's only durable trace of which charge model priced its standbys
+	// (#644 review). Normalize is idempotent, so New's own call is unaffected.
+	if err := cfg.Normalize(); err != nil {
+		return err
 	}
 	pool, err := vmpool.New(cfg, lc, vmpool.RealClock())
 	if err != nil {

@@ -414,8 +414,24 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, *runPool, ColdCause
 			// colder host to promote. On a host whose slots x PerVMBytes fit the
 			// budget this never fires; see admitPromotionLocked.
 			if err := p.admitPromotionLocked(vm); err != nil {
-				p.mu.Unlock()
-				return nil, nil, "", p.countRefusal(err)
+				// RefuseMemoryBudget is fundable: eviction needs only
+				// perVM minus this standby's dirty charge of headroom, which other
+				// idle runs' standbys can cover — without it, a standby-heavy host
+				// (replenishment books the budget to within one warming of full)
+				// would fail warm acquires far below the slot ceiling, which is the
+				// density regression #644 exists to remove. rp is excluded from the
+				// victims, so the pop's slice arithmetic below stays valid.
+				// RefuseHostMemory is NOT fundable this way: reclaimLoop destroys
+				// asynchronously, so MemAvailable is unchanged at the re-check and
+				// the standbys would be burned for a refusal either way.
+				if ReasonOf(err) == RefuseMemoryBudget {
+					p.evictForPromotionLocked(rp, vm)
+					err = p.admitPromotionLocked(vm)
+				}
+				if err != nil {
+					p.mu.Unlock()
+					return nil, nil, "", p.countRefusal(err)
+				}
 			}
 			rp.ready = rp.ready[:n-1]
 			rp.inFlight++

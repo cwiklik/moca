@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // memAvailable is the seam over readHostMemAvailable: a package-level var so a
@@ -12,6 +14,43 @@ import (
 // linux a test cannot arrange a specific MemAvailable). Same indirection pattern
 // as chvChown/chvChmod in launcher_chv.go.
 var memAvailable = readHostMemAvailable
+
+// The admission-path cache over memAvailable (#644 review): hostFloorLocked runs
+// under the pool's global mutex on EVERY admission and warm acquire, and an
+// uncached read would put file I/O on that lock. A ~100ms stale MemAvailable
+// weakens nothing — it moves on the scale of seconds, and the floor is a backstop
+// beside the budget arithmetic, not a meter — while collapsing the reads to ~10/s
+// however hot admission is. Errors are cached too: a broken /proc/meminfo fails
+// closed either way, and retrying it under the lock is the same I/O problem.
+const memAvailableTTL = 100 * time.Millisecond
+
+var (
+	memCacheMu  sync.Mutex
+	memCacheVal int64
+	memCacheErr error
+	memCacheAt  time.Time
+)
+
+// cachedMemAvailable is what the admission path reads.
+func cachedMemAvailable() (int64, error) {
+	memCacheMu.Lock()
+	defer memCacheMu.Unlock()
+	if !memCacheAt.IsZero() && time.Since(memCacheAt) < memAvailableTTL {
+		return memCacheVal, memCacheErr
+	}
+	memCacheVal, memCacheErr = memAvailable()
+	memCacheAt = time.Now()
+	return memCacheVal, memCacheErr
+}
+
+// invalidateMemAvailableCache drops the cached MemAvailable so the next
+// cachedMemAvailable re-reads the seam. Test-only: production has no reason to
+// force a read that is at most memAvailableTTL away anyway.
+func invalidateMemAvailableCache() {
+	memCacheMu.Lock()
+	defer memCacheMu.Unlock()
+	memCacheAt = time.Time{}
+}
 
 // readHostMemAvailable reads MemAvailable out of /proc/meminfo, in bytes.
 //

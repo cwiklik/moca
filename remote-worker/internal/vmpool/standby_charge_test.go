@@ -3,6 +3,7 @@ package vmpool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -131,8 +132,11 @@ func TestHeadroomFullRestoresThePre644Charge(t *testing.T) {
 // charging safe: promoting a standby to running re-prices it from its dirty
 // charge to a full PerVMBytes, and that must still fit the budget. Here one
 // running VM plus one 32 MiB standby is within the budget, but promoting that
-// standby (288 MiB) is not — so the warm acquire is refused, and the standby is
-// LEFT IN PLACE (the check is pure; a later, colder host can promote it).
+// standby (288 MiB) is not — and no eviction can fund it: the only idle standbys
+// belong to the promoting run itself (excluded from the victim set), and the
+// running VM's run is busy. So the warm acquire is refused, the eviction attempt
+// detaches nothing, and the standby is LEFT IN PLACE for a later, colder host to
+// promote.
 func TestAWarmAcquireIsRepricedAtPopTime(t *testing.T) {
 	p, lc, clk := standbyPool(t, 2*perVM, 4, 1<<20)
 	primed(t, p, clk, "run-a") // 2 standbys, 64 MiB committed
@@ -149,7 +153,10 @@ func TestAWarmAcquireIsRepricedAtPopTime(t *testing.T) {
 			s.CommittedBytes, perVM+2*floorCharge)
 	}
 
-	// Promoting run-a's standby would reach 352 - 32 + 288 = 608 MiB > 576: refused.
+	// Promoting run-a's standby would reach 352 - 32 + 288 = 608 MiB > 576: refused,
+	// and unfundable — run-a's other standby is the only idle victim candidate and
+	// the promoting run is excluded from the victim set.
+	before := p.Stats().BudgetEvictions
 	if _, err := p.Exec(context.Background(), "run-a", Exec{Command: "true"}, &capturingSink{}); ReasonOf(err) != RefuseMemoryBudget {
 		t.Fatalf("warm acquire under a full running set: err = %v, want a %s refusal — promotion must be re-priced at pop time",
 			err, RefuseMemoryBudget)
@@ -157,6 +164,10 @@ func TestAWarmAcquireIsRepricedAtPopTime(t *testing.T) {
 	if s := p.Stats(); s.StandbysResident != DefaultStandbyDepth {
 		t.Fatalf("StandbysResident = %d after a refused promotion, want %d — the check is pure and must leave the standby in place",
 			s.StandbysResident, DefaultStandbyDepth)
+	}
+	if evicted := p.Stats().BudgetEvictions - before; evicted != 0 {
+		t.Fatalf("BudgetEvictions delta = %d, want 0 — an unfundable promotion must not shed the promoting run's own standbys",
+			evicted)
 	}
 
 	// Once the running VM finishes, the same warm acquire fits and succeeds.
@@ -208,6 +219,133 @@ func TestEvictionShedsAsMuchDirtyChargeAsAdmissionNeeds(t *testing.T) {
 	release()
 }
 
+// primeFillerRuns primes n filler runs AFTER the named runs, in clock order, so
+// the named runs keep their relative lastExec ordering: whatever was primed
+// earlier is colder. Returns nothing; primed itself asserts each run reached D.
+func primeFillerRuns(t *testing.T, p Pool, clk *fakeClock, first int, n int) {
+	t.Helper()
+	for i := first; i < first+n; i++ {
+		primed(t, p, clk, fmt.Sprintf("fill-%02d", i))
+	}
+}
+
+// TestSequentialWarmAcquiresOnOneRunShedIdleStandbys is the review's must-fix
+// scenario for #644: replenishment books the budget to within one warming of
+// full with OTHER runs' cheap standbys, so a promotion check that cannot be
+// funded by eviction fails the SECOND warm acquire on a run while only one VM
+// of a ten-VM budget is running — far below the slot ceiling, which is exactly
+// the density regression #644 exists to remove. Funding the promotion from
+// other runs' standbys keeps warm acquires succeeding as the slots fill.
+func TestSequentialWarmAcquiresOnOneRunShedIdleStandbys(t *testing.T) {
+	// Budget 10 VMs (2880 MiB). 40 runs x D=2 standbys at the 32 MiB floor book
+	// 2560 MiB: replenishment stops there because the next warming charge, at
+	// full price, would not fit. run-z primed LAST so it is the warmest run and
+	// its own standbys are the last thing LRU eviction would want anyway.
+	p, lc, clk := standbyPool(t, 10*perVM, 4, 1<<20)
+	primeFillerRuns(t, p, clk, 0, 39)
+	primed(t, p, clk, "run-z") // run 40 of 40: 80 standbys, 2560 MiB committed
+
+	release, entered := hold(lc)
+	// NOT deferred: released once below; hold's release closes a channel.
+	go func() { _, _ = p.Exec(context.Background(), "run-z", Exec{Command: "sleep"}, &capturingSink{}) }()
+	<-entered
+	// Warm acquire 1 fits without eviction: 2560 - 32 + 288 = 2816 <= 2880.
+	if s := p.Stats(); s.CommittedBytes != 10*perVM-2*floorCharge {
+		t.Fatalf("CommittedBytes = %d, want %d (one full-price VM + 79 floor-charged standbys)",
+			s.CommittedBytes, 10*perVM-2*floorCharge)
+	}
+
+	before := p.Stats().BudgetEvictions
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(context.Background(), "run-z", Exec{Command: "sleep-2"}, &capturingSink{})
+		done <- err
+	}()
+	select {
+	case <-entered: // the second warm acquire reached Run: the promotion was funded
+	case err := <-done:
+		t.Fatalf("second warm acquire on run-z: %v — the promotion must be funded from other runs' standbys", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second warm acquire neither reached Run nor returned — promotion stuck")
+	}
+	// 2816 - 32 + 288 = 3072 > 2880, short 192 MiB = six floor-charged standbys.
+	if evicted := p.Stats().BudgetEvictions - before; evicted != 6 {
+		t.Fatalf("BudgetEvictions delta = %d, want 6 — funding this promotion takes exactly 192 MiB of dirty charge",
+			evicted)
+	}
+	if s := p.Stats(); s.InFlight != 2 || s.StandbysResident != 80-6-2 {
+		t.Fatalf("InFlight = %d, StandbysResident = %d, want 2 and %d — two warm acquires running, six standbys shed, two popped",
+			s.InFlight, s.StandbysResident, 80-6-2)
+	}
+	if s := p.Stats(); s.DestroyFailures != 0 {
+		t.Fatalf("DestroyFailures = %d, want 0 — no VM may be destroyed out from under a running exec", s.DestroyFailures)
+	}
+	release()
+}
+
+// TestPromotionEvictionSparesThePromotingRun pins the exclude in
+// evictForPromotionLocked from the one side where it is load-bearing: a
+// promotion whose shortfall exceeds what every OTHER idle run can shed.
+// acquire bumps the promoting run's lastExec to now before the check, so the
+// run is the WARMST candidate and the coldest-first victim loop reaches it
+// LAST — exactly after draining everyone else — and would there hand the very
+// standby being promoted to reclaimQ, then pop it into inFlight: a VM destroyed
+// while its Exec runs. With the exclusion that promotion is simply unfundable:
+// refused, nothing shed, the standby left in place for a colder host.
+func TestPromotionEvictionSparesThePromotingRun(t *testing.T) {
+	// Budget 576 MiB (2 VMs at full price). run-y plus three filler runs hold
+	// 8 floor-charged standbys (256 MiB); a VM held running on run-h adds 288,
+	// for 544 committed. Promoting run-y's standby would reach
+	// 544 - 32 + 288 = 800 > 576, short 224 MiB — more than the fillers' 192,
+	// so only the promoting run's own standbys could close the gap.
+	p, lc, clk := standbyPool(t, 2*perVM, 4, 1<<20)
+	primed(t, p, clk, "run-y")
+	primeFillerRuns(t, p, clk, 0, 3)
+
+	release, entered := hold(lc)
+	// Deferred rather than explicit: this test's last act, and a t.Fatal above
+	// (the mutation path) must still open hold's gate or the pool's cleanup
+	// would wait on a VM that never finishes. Deferring keeps release a
+	// single close.
+	defer release()
+	go func() { _, _ = p.Exec(context.Background(), "run-h", Exec{Command: "sleep"}, &capturingSink{}) }()
+	<-entered
+	if s := p.Stats(); s.CommittedBytes != 8*floorCharge+perVM {
+		t.Fatalf("CommittedBytes = %d, want %d (eight floor-charged standbys + one running VM)",
+			s.CommittedBytes, 8*floorCharge+perVM)
+	}
+
+	before := p.Stats().BudgetEvictions
+	runYDestroyed := lc.destroyedFor("run-y") // its priming Exec's destroy, +0 expected
+	// In a goroutine with a timeout, not a synchronous call: under the exclusion
+	// this Exec is refused before Run and returns immediately, but a regression
+	// that admitted it would park it in hold's gate until release — a hang, and
+	// the timeout is what turns that into a failure with a name.
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(context.Background(), "run-y", Exec{Command: "true"}, &capturingSink{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if ReasonOf(err) != RefuseMemoryBudget {
+			t.Fatalf("warm acquire fundable only by the promoting run's own standbys: err = %v, want a %s refusal — those standbys are excluded from the victim set",
+				err, RefuseMemoryBudget)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run-y's warm acquire was admitted instead of refused — it is now parked in hold's gate, which is exactly what spending the promoting run's own standbys would buy")
+	}
+	if evicted := p.Stats().BudgetEvictions - before; evicted != 0 {
+		t.Fatalf("BudgetEvictions delta = %d, want 0 — an unfundable promotion must shed nothing", evicted)
+	}
+	if got := lc.destroyedFor("run-y") - runYDestroyed; got != 0 {
+		t.Fatalf("run-y lost %d VMs to reclamation, want 0 — the standby being promoted must never reach reclaimQ", got)
+	}
+	if s := p.Stats(); s.StandbysResident != 8 {
+		t.Fatalf("StandbysResident = %d, want 8 — the refused promotion leaves every standby in place", s.StandbysResident)
+	}
+}
+
 // TestHostMemFloorRefusesDistinctlyFromTheBudget pins the opt-in MemAvailable
 // backstop: below the floor, admission refuses with RefuseHostMemory (a cause
 // apart from RefuseMemoryBudget, so a density ladder can tell "budget sized
@@ -222,6 +360,7 @@ func TestHostMemFloorRefusesDistinctlyFromTheBudget(t *testing.T) {
 	defer func() { memAvailable = old }()
 
 	memAvailable = func() (int64, error) { return 512 << 20, nil }
+	invalidateMemAvailableCache()
 	if _, err := p.Exec(context.Background(), "run-a", Exec{Command: "true"}, &capturingSink{}); ReasonOf(err) != RefuseHostMemory {
 		t.Fatalf("err = %v, want a %s refusal — MemAvailable is below the floor", err, RefuseHostMemory)
 	}
@@ -231,11 +370,13 @@ func TestHostMemFloorRefusesDistinctlyFromTheBudget(t *testing.T) {
 	}
 
 	memAvailable = func() (int64, error) { return 8 << 30, nil }
+	invalidateMemAvailableCache()
 	if _, err := p.Exec(context.Background(), "run-a", Exec{Command: "true"}, &capturingSink{}); err != nil {
 		t.Fatalf("exec with MemAvailable recovered: %v", err)
 	}
 
 	memAvailable = func() (int64, error) { return 0, errors.New("no /proc/meminfo on this darwin") }
+	invalidateMemAvailableCache()
 	if _, err := p.Exec(context.Background(), "run-b", Exec{Command: "true"}, &capturingSink{}); ReasonOf(err) != RefuseHostMemory {
 		t.Fatalf("err = %v, want a %s refusal — an unreadable MemAvailable must fail closed", err, RefuseHostMemory)
 	}
@@ -253,6 +394,7 @@ func TestHostMemFloorAppliesToPromotionToo(t *testing.T) {
 	old := memAvailable
 	defer func() { memAvailable = old }()
 	memAvailable = func() (int64, error) { return 512 << 20, nil }
+	invalidateMemAvailableCache()
 
 	if _, err := p.Exec(context.Background(), "run-a", Exec{Command: "true"}, &capturingSink{}); ReasonOf(err) != RefuseHostMemory {
 		t.Fatalf("warm acquire under a low floor: err = %v, want a %s refusal", err, RefuseHostMemory)
