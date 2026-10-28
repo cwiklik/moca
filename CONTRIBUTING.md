@@ -96,8 +96,9 @@ git commit -s -m "feat: Add new feature"
 AI assistance is acknowledged with `Assisted-By`, never with trailers or footers
 GitHub parses as co-authorship (they inflate contributor stats):
 
-- **Commits**: the `commit-msg` hook installed by `pre-commit install` rewrites
-  `Co-authored-by:` and `Made-with:` lines naming an AI to a single
+- **Commits**: the `commit-msg` hook installed by `pre-commit install` strips
+  `Made-with:` lines and replaces `Co-authored-by:` trailers naming Claude,
+  Cursor, or Anthropic with a single
   `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>` trailer. Commit
   normally; no manual handling is needed.
 - **PR descriptions**: if AI assisted, end the body with `Assisted-By: Claude Code`.

@@ -1,15 +1,15 @@
 # Reject AI-attribution footers in PR descriptions (see CONTRIBUTING.md,
-# "Attribution"). Runs on opened and edited only: the body does not change on
-# new pushes. Uses the event payload, so no checkout or token is needed and
-# it works unchanged for fork PRs.
+# "Attribution"). Uses the event payload, so no checkout or token is needed
+# and it works unchanged for fork PRs. synchronize/reopened are included so
+# the check reports on every head SHA -- required status checks hang forever
+# on pushes where no run exists.
 name: PR attribution
 
 on:
   pull_request:
-    types: [opened, edited]
+    types: [opened, edited, reopened, synchronize]
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   check:
@@ -24,10 +24,12 @@ jobs:
           body() { printf '%s' "${PR_BODY:-}"; }
 
           # Same forbidden strings as the PR Description Attribution section in
-          # CLAUDE.md / CONTRIBUTING.md. Assisted-By is the accepted form.
-          if body | grep -qiE 'generated with claude|created with claude|made with claude|made-with|🤖'; then
+          # CLAUDE.md / CONTRIBUTING.md. Assisted-By is the accepted form. The
+          # emoji and Made-with are line-anchored so ordinary prose mentioning
+          # them mid-sentence does not trip the check.
+          if body | grep -qiE '(generated|created|made) with \[?claude|^[[:space:]]*made-with:|^[[:space:]]*🤖'; then
             echo "::error::PR description contains a prohibited AI-attribution footer."
-            echo "::error::Remove 'Generated with Claude Code' / 'Created with Claude Code' / the 🤖 line, and use 'Assisted-By: Claude Code' instead (see CONTRIBUTING.md, Attribution)."
+            echo "::error::Remove 'Generated with Claude Code' / 'Created with Claude Code' / 'Made-with' / the 🤖 line, and use 'Assisted-By: Claude Code' instead (see CONTRIBUTING.md, Attribution)."
             exit 1
           fi
 
