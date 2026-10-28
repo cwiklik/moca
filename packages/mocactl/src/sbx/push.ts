@@ -161,6 +161,7 @@ const AGENT_DIRS: Record<string, string> = {
   '.codex': 'Codex CLI configuration, which can start MCP servers',
   '.agents': "Codex CLI's repo skills, whose scripts it runs on this machine",
   '.pi': 'Pi extensions, skills and prompts, which it loads as code from the project',
+  '.bob': "IBM Bob's settings, which can start MCP servers",
   '.husky': 'git hooks',
 };
 const AGENT_FILES: Record<string, string> = {
@@ -176,9 +177,11 @@ const VSCODE_FILES: Record<string, string> = {
 /**
  * The prompt files an agent reads: warned about, not refused (they are text, not executables).
  * `AGENTS.override.md` is Codex CLI's: it is read in preference to `AGENTS.md`, so a new one
- * silently replaces the instructions an agent session reads (#592).
+ * silently replaces the instructions an agent session reads (#592). `.bobrules` is IBM Bob's own
+ * steering file, which `sbx up` does not write and so holds no `sbx` block: a change to it is all
+ * change, and warned about whole (#657 review).
  */
-const PROMPT_FILES = new Set(['claude.md', 'agents.md', 'agents.override.md']);
+const PROMPT_FILES = new Set(['claude.md', 'agents.md', 'agents.override.md', '.bobrules']);
 
 const foldedIn = (seg: string, names: Record<string, string>): string | undefined =>
   folds(seg)

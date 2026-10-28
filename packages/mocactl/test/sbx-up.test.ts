@@ -247,8 +247,8 @@ describe('mocactl sbx push and pull (SBX0 §6.2, §10.3)', () => {
     expect(readFileSync(join(ws, 'src/app.py'), 'utf8')).toBe('print("agent")\n');
     expect(await h.run(['push', '--force'])).toBe(0);
     expect(readFileSync(join(ws, 'src/app.py'), 'utf8')).toBe('print(1)\n');
-    // The 7 files `up` pushed, and the 5 agent-configuration files it wrote after its push.
-    expect(h.err()).toMatch(new RegExp(`pushed 12 files \\(0\\.0 MiB\\) to ${NEW}`));
+    // The 7 files `up` pushed, and the 6 agent-configuration files it wrote after its push.
+    expect(h.err()).toMatch(new RegExp(`pushed 13 files \\(0\\.0 MiB\\) to ${NEW}`));
   });
 
   it("push is refused over the agent's new file in a source directory named build (review C1)", async () => {
@@ -380,12 +380,19 @@ describe('mocactl sbx push and pull (SBX0 §6.2, §10.3)', () => {
 });
 
 describe('mocactl sbx up and rm: the agent configuration (SBX0 §6.3, plan Review Focus 3)', () => {
-  const CFG = ['.mcp.json', '.claude/settings.json', 'opencode.json', 'CLAUDE.md', 'AGENTS.md'];
+  const CFG = [
+    '.mcp.json',
+    '.claude/settings.json',
+    'opencode.json',
+    '.bob/settings.json',
+    'CLAUDE.md',
+    'AGENTS.md',
+  ];
 
-  it('up configures Claude Code and OpenCode after the push, and says so once', async () => {
+  it('up configures Claude Code, OpenCode and IBM Bob after the push, and says so once', async () => {
     const h = harness();
     expect(await h.run(['up'])).toBe(0);
-    expect(h.err()).toContain(`configured Claude Code and OpenCode: ${CFG.join(', ')}`);
+    expect(h.err()).toContain(`configured Claude Code, OpenCode and IBM Bob: ${CFG.join(', ')}`);
     expect(checkAgentConfig(h.r)).toEqual([]);
     // Pushed before it was written: the sandbox's tree is the developer's, not sbx's config.
     expect(existsSync(join(h.ws.get(NEW).ws, '.mcp.json'))).toBe(false);

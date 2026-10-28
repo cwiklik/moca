@@ -479,10 +479,12 @@ persistence follows the existing `base/redis.yaml`.
 - **`pull --apply` refuses a patch that writes `.git`, `.sbx/` or the agent-configuration and
   local-hook files** (`.mcp.json`, `.claude/`, `opencode.json(c)`, `.opencode/`, `.codex/`,
   `.agents/` (Codex CLI's repo skills), `.pi/` (Pi loads project-local `extensions/`, `skills/` and
-  `prompts/`), `.vscode/tasks.json`, `.vscode/settings.json`, `.husky/`, `.envrc`, or `.vscode`
+  `prompts/`), `.bob/` (IBM Bob's settings, which can start MCP servers),
+  `.vscode/tasks.json`, `.vscode/settings.json`, `.husky/`, `.envrc`, or `.vscode`
   itself), on either side of a rename or copy, at any depth and under case and Unicode folding. A
-  change to `CLAUDE.md`, `AGENTS.md` or `AGENTS.override.md` (Codex reads it in preference to
-  `AGENTS.md`) outside the `sbx up` block is applied with a warning.
+  change to a steering file — `CLAUDE.md`, `AGENTS.md`, `AGENTS.override.md` (Codex reads it in
+  preference to `AGENTS.md`) or `.bobrules` (IBM Bob's, which `sbx up` does not write, so a change
+  to it is all change) — outside the `sbx up` block is applied with a warning.
 - **"Changes not yet pulled"** means the tree differs from `refs/sbx/baseline` (a superset of a
   non-empty porcelain status that also counts the agent's own commits), or the workspace holds files
   with no baseline.
@@ -511,6 +513,12 @@ Every curated template ships `tar` and `git` (§8.2).
   and `tools` set to `false` for `bash`, `read`, `edit`, `write`, `patch`, `apply_patch`
   (`patch`'s newer name), `glob`, `grep`, `list`, `lsp`, `webfetch`, `websearch`, `task`, and
   older versions' `multiedit`.
+- **IBM Bob:** `.bob/settings.json` (its project scope, which `bob mcp add` writes by default) gets
+  `mcpServers.sandbox = { "command": "mocactl", "args": ["sbx", "mcp"] }`, the same entry
+  `.mcp.json` holds. **No tool list:** Bob has no equivalent of Claude Code's `permissions.deny` —
+  `--allowed-tools` waives the confirmation prompt rather than removing a tool — so its local
+  tools stay available and `sbx up` cannot deny them. `sbx doctor` therefore checks only that the
+  server is there. Bob's own approval mode is the remaining protection.
 - **`CLAUDE.md` and `AGENTS.md`:** a block between `<!-- sbx:begin -->` and `<!-- sbx:end -->`
   holding the MCP server's own instructions (§6.4), which state that:
   - the code lives in a remote sandbox at `/workspace`;

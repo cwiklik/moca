@@ -44,7 +44,14 @@ const dir = () => {
 };
 const json = (d: string, f: string) => JSON.parse(readFileSync(join(d, f), 'utf8'));
 const text = (d: string, f: string) => readFileSync(join(d, f), 'utf8');
-const FILES = ['.mcp.json', '.claude/settings.json', 'opencode.json', 'CLAUDE.md', 'AGENTS.md'];
+const FILES = [
+  '.mcp.json',
+  '.claude/settings.json',
+  'opencode.json',
+  '.bob/settings.json',
+  'CLAUDE.md',
+  'AGENTS.md',
+];
 const conflictOf = (fn: () => unknown): ConfigConflict => {
   try {
     fn();
@@ -56,7 +63,7 @@ const conflictOf = (fn: () => unknown): ConfigConflict => {
 };
 
 describe('agent configuration (SBX0 §6.3)', () => {
-  it('configures both agents in an empty repository', () => {
+  it('configures every agent in an empty repository', () => {
     const d = dir();
     expect(writeAgentConfig(d).changed.sort()).toEqual([...FILES].sort());
     expect(json(d, '.mcp.json').mcpServers.sandbox).toEqual({
@@ -75,11 +82,60 @@ describe('agent configuration (SBX0 §6.3)', () => {
       enabled: true,
     });
     for (const t of OPENCODE_OFF) expect(o.tools[t]).toBe(false);
+    // IBM Bob reads .bob/settings.json from the repository, so up merges into it as into the
+    // others. It has no deny list to write: its local tools stay available (#593's lesson).
+    expect(json(d, '.bob/settings.json').mcpServers.sandbox).toEqual({
+      command: 'mocactl',
+      args: ['sbx', 'mcp'],
+    });
     for (const f of ['CLAUDE.md', 'AGENTS.md']) {
       const md = text(d, f);
       expect(md).toBe(`${MARK_BEGIN}\n${RULES}\n${MARK_END}\n`);
       expect(md).toMatch(/fresh VM/);
     }
+    expect(checkAgentConfig(d)).toEqual([]);
+  });
+
+  it("keeps what the developer has in Bob's settings, and takes back only ours", () => {
+    const d = dir();
+    mkdirSync(join(d, '.bob'), { recursive: true });
+    writeFileSync(
+      join(d, '.bob/settings.json'),
+      JSON.stringify(
+        { mcpServers: { mine: { command: 'x' } }, security: { auth: 'sso' } },
+        null,
+        2,
+      ) + '\n',
+    );
+    writeAgentConfig(d);
+    const b = json(d, '.bob/settings.json');
+    expect(b.mcpServers.sandbox).toEqual({ command: 'mocactl', args: ['sbx', 'mcp'] });
+    expect(b.mcpServers.mine).toEqual({ command: 'x' });
+    expect(b.security).toEqual({ auth: 'sso' });
+    expect(checkAgentConfig(d)).toEqual([]);
+    // rm leaves the developer's file, minus our entry; it did not create it, so it stays.
+    removeAgentConfig(d);
+    const after = json(d, '.bob/settings.json');
+    expect(after.mcpServers).toEqual({ mine: { command: 'x' } });
+    expect(after.security).toEqual({ auth: 'sso' });
+  });
+
+  it('deletes the .bob directory it created, when rm leaves nothing in it', () => {
+    const d = dir();
+    expect(existsSync(join(d, '.bob'))).toBe(false);
+    writeAgentConfig(d);
+    expect(existsSync(join(d, '.bob/settings.json'))).toBe(true);
+    removeAgentConfig(d);
+    expect(existsSync(join(d, '.bob/settings.json'))).toBe(false);
+    expect(existsSync(join(d, '.bob'))).toBe(false);
+  });
+
+  it("doctor reports Bob's missing server, and nothing once up has run", () => {
+    const d = dir();
+    expect(checkAgentConfig(d)).toContain(
+      'IBM Bob: .bob/settings.json has no sandbox MCP server (mocactl sbx mcp)',
+    );
+    writeAgentConfig(d);
     expect(checkAgentConfig(d)).toEqual([]);
   });
 
@@ -417,11 +473,20 @@ describe('agent configuration (SBX0 §6.3)', () => {
       'mcp.sandbox',
     ],
     ['opencode.json', '{ not json', 'opencode.json'],
+    // IBM Bob: a foreign server under our name, and a non-object where mcpServers goes.
+    [
+      '.bob/settings.json',
+      JSON.stringify({ mcpServers: { sandbox: { command: 'other', args: [] } } }),
+      'mcpServers.sandbox',
+    ],
+    ['.bob/settings.json', JSON.stringify({ mcpServers: 7 }), 'mcpServers'],
     ['CLAUDE.md', `a\n${MARK_BEGIN}\nb\n`, 'markers'],
     ['AGENTS.md', `${MARK_BEGIN}\n${MARK_END}\n${MARK_BEGIN}\n${MARK_END}\n`, 'markers'],
   ])('stops on a conflict in %s (%s), naming %s, and writes nothing', (file, body, key) => {
     const d = dir();
     mkdirSync(join(d, '.claude'), { recursive: true });
+    if (file.includes('/'))
+      mkdirSync(join(d, file.slice(0, file.lastIndexOf('/'))), { recursive: true });
     writeFileSync(join(d, file), body);
     for (const dryRun of [true, false]) {
       const err = conflictOf(() => writeAgentConfig(d, { dryRun }));
