@@ -91,6 +91,20 @@ All commits must include DCO sign-off:
 git commit -s -m "feat: Add new feature"
 ```
 
+## Attribution
+
+AI assistance is acknowledged with `Assisted-By`, never with trailers or footers
+GitHub parses as co-authorship (they inflate contributor stats):
+
+- **Commits**: the `commit-msg` hook installed by `pre-commit install` rewrites
+  `Co-authored-by:` and `Made-with:` lines naming an AI to a single
+  `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>` trailer. Commit
+  normally; no manual handling is needed.
+- **PR descriptions**: if AI assisted, end the body with `Assisted-By: Claude Code`.
+  Do not use "Generated with Claude Code", "Created with Claude Code", the 🤖
+  footer line, or `Made-with`. Delete any footer your tool inserted before opening
+  the PR — the `pr-attribution` CI check rejects PR bodies containing them.
+
 ## Documentation
 
 Docs conventions (where things go, maturity labels, banners, link checking) are in

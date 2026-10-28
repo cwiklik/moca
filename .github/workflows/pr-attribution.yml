@@ -1,0 +1,34 @@
+# Reject AI-attribution footers in PR descriptions (see CONTRIBUTING.md,
+# "Attribution"). Runs on opened and edited only: the body does not change on
+# new pushes. Uses the event payload, so no checkout or token is needed and
+# it works unchanged for fork PRs.
+name: PR attribution
+
+on:
+  pull_request:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check PR body for prohibited AI-attribution footers
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # null body (empty PR description) must pass, not crash
+          body() { printf '%s' "${PR_BODY:-}"; }
+
+          # Same forbidden strings as the PR Description Attribution section in
+          # CLAUDE.md / CONTRIBUTING.md. Assisted-By is the accepted form.
+          if body | grep -qiE 'generated with claude|created with claude|made with claude|made-with|🤖'; then
+            echo "::error::PR description contains a prohibited AI-attribution footer."
+            echo "::error::Remove 'Generated with Claude Code' / 'Created with Claude Code' / the 🤖 line, and use 'Assisted-By: Claude Code' instead (see CONTRIBUTING.md, Attribution)."
+            exit 1
+          fi
+
+          echo "PR body attribution OK"
