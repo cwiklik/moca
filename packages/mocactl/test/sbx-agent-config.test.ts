@@ -1098,6 +1098,8 @@ describe('agent configuration (SBX0 §6.3)', () => {
     expect(found).toHaveLength(1);
     expect(found[0]).toContain('delete .claude/settings.local.json');
     expect(found[0]).toContain('Use this MCP server');
+    // The launcher loads the server without asking, so it works in this state too (#577).
+    expect(found[0]).toContain('mocactl sbx claude');
     // The consequence, so the line reads as a problem and not as a note about a key.
     expect(found[0]).toMatch(/neither the sandbox's tools nor its own/);
     // And `up` is still refused, so the fix doctor names is the only one there is.

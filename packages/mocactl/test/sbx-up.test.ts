@@ -404,6 +404,11 @@ describe('mocactl sbx up and rm: the agent configuration (SBX0 §6.3, plan Revie
     expect(err).toContain('the highlighted default declines');
     expect(err).toContain(`start claude in ${h.r}`);
     expect(err).toContain('not a subdirectory');
+    // The launcher is the way that asks nothing about the server: named here, where the user is
+    // looking (#577). The folder-trust question is the one it cannot take away, and the warning
+    // does not promise more than the flags do.
+    expect(err).toContain('mocactl sbx claude');
+    expect(err).toContain('trust the folder');
     // Said with the configuration it refers to: nothing written, nothing to warn about.
     expect(await h.run(['up'])).toBe(0);
     expect(h.err()).not.toContain('Use this MCP server');
