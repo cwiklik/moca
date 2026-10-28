@@ -239,7 +239,10 @@ func TestGateCredentialNeverInGuest(t *testing.T) {
 	lc := fcLauncherWith(t, func(o *FirecrackerOptions) { o.Egress = client })
 	workspace := sameDeviceSiblingDir(t, envOr("SH_SNAPSHOT_IMAGE_DIR", "/srv/snapshots/swebench-py311"))
 	vm, err := lc.Restore(context.Background(), RestoreRequest{
-		ID: "vm-credential-gate", Key: "credential-gate", WorkspaceDir: workspace, GuestRAMBytes: 256 << 20,
+		// The ID is short on purpose: the jailed firecracker.socket path
+		// (<chroot base>/firecracker/<ID>/root/run/firecracker.socket) must fit in
+		// the 108-byte sun_path limit under the rig's chroot base.
+		ID: "vm-cred", Key: "cred-gate", WorkspaceDir: workspace, GuestRAMBytes: 256 << 20,
 	})
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
