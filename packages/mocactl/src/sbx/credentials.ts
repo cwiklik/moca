@@ -1,10 +1,6 @@
 import { ApiError } from '../api/errors.js';
 import type { CredentialBinding, PutCredentialRequest } from '../api/types.js';
-import {
-  CREDENTIAL_NAME,
-  descriptionProblem,
-  secretFromStdin,
-} from '../core/credential-checks.js';
+import { CREDENTIAL_NAME, descriptionProblem, secretFromStdin } from '../core/credential-checks.js';
 import { sanitizeRemote } from '../core/sanitize.js';
 import { cmdCredentialDelete, cmdCredentials } from '../headless.js';
 import { SBX_EXIT, failed, type SbxCtx } from './commands.js';
@@ -44,6 +40,11 @@ export function expandPreset(
   name: string,
   stdinValue: string,
 ): { name: string; req: PutCredentialRequest }[] {
+  if (new Set(preset.credentials.map((c) => c.stdinField)).size > 1) {
+    throw new Error(
+      `preset "${preset.id}" mixes stdin fields; every credential in a preset must share one stdinField`,
+    );
+  }
   return preset.credentials.map((c) => ({
     name: c.suffix ? `${name}-${c.suffix}` : name,
     req: {
@@ -83,8 +84,12 @@ export interface AddOptions {
 }
 
 /** What is wrong with the arguments, before stdin is read or a request made. */
-export function addProblem(o: AddOptions, catalog: readonly Preset[] = PRESETS): string | undefined {
-  if (!CREDENTIAL_NAME.test(o.name)) return 'name: lower-case letters, digits and dashes, 1-40 characters';
+export function addProblem(
+  o: AddOptions,
+  catalog: readonly Preset[] = PRESETS,
+): string | undefined {
+  if (!CREDENTIAL_NAME.test(o.name))
+    return 'name: lower-case letters, digits and dashes, 1-40 characters';
   if (o.preset !== undefined) {
     if (o.hosts.length > 0 || o.kind !== undefined) {
       return '--preset fixes the hosts and the kind: do not pass --host or --kind with it';
@@ -93,12 +98,15 @@ export function addProblem(o: AddOptions, catalog: readonly Preset[] = PRESETS):
     if (!p) {
       return `unknown preset '${sanitizeRemote(o.preset)}'; known: ${catalog.map((x) => x.id).join(', ')}`;
     }
-    const long = p.credentials.map((c) => (c.suffix ? `${o.name}-${c.suffix}` : o.name)).find(
-      (n) => !CREDENTIAL_NAME.test(n),
-    );
-    return long ? `name: ${long} would be longer than 40 characters; use a shorter name` : undefined;
+    const long = p.credentials
+      .map((c) => (c.suffix ? `${o.name}-${c.suffix}` : o.name))
+      .find((n) => !CREDENTIAL_NAME.test(n));
+    return long
+      ? `name: ${long} would be longer than 40 characters; use a shorter name`
+      : undefined;
   }
-  if (o.hosts.length === 0) return 'credentials add needs --host DEST (host[:port][/prefix]) or --preset ID';
+  if (o.hosts.length === 0)
+    return 'credentials add needs --host DEST (host[:port][/prefix]) or --preset ID';
   return descriptionProblem({
     name: o.name,
     kind: o.kind ?? 'bearer',
@@ -135,7 +143,11 @@ export async function addCredential(
   let writes: { name: string; req: PutCredentialRequest }[];
   if (preset) {
     // One stdin, one value: each credential reads it as its own stdinField.
-    const read = secretFromStdin(preset.credentials[0]!.kind, text, preset.credentials[0]!.stdinField);
+    const read = secretFromStdin(
+      preset.credentials[0]!.kind,
+      text,
+      preset.credentials[0]!.stdinField,
+    );
     if ('problem' in read) {
       c.io.err(`sbx: ${read.problem}`);
       return SBX_EXIT.usage;
@@ -175,10 +187,14 @@ export async function addCredential(
       return code;
     }
     stored.push({ name: w.name, hosts: w.req.destination.hosts });
-    c.io.err(`stored credential ${sanitizeRemote(w.name)} for ${w.req.destination.hosts.map(sanitizeRemote).join(', ')}`);
+    c.io.err(
+      `stored credential ${sanitizeRemote(w.name)} for ${w.req.destination.hosts.map(sanitizeRemote).join(', ')}`,
+    );
   }
   if (c.json) {
-    c.io.out(JSON.stringify({ credentials: stored.map((s) => ({ ...s, status: 'stored' })) }) + '\n');
+    c.io.out(
+      JSON.stringify({ credentials: stored.map((s) => ({ ...s, status: 'stored' })) }) + '\n',
+    );
   }
   if (preset) c.io.err(preset.hint);
   return SBX_EXIT.ok;

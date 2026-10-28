@@ -51,6 +51,12 @@ describe('the sbx credential preset catalog', () => {
     }
   });
 
+  it('has one stdinField per preset', () => {
+    for (const p of PRESETS) {
+      expect(new Set(p.credentials.map((c) => c.stdinField)).size).toBe(1);
+    }
+  });
+
   it('pins the first two entries', () => {
     const github = PRESETS.find((p) => p.id === 'github')!;
     expect(github.credentials).toEqual([

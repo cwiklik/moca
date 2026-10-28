@@ -11,6 +11,8 @@ dist/
 *.pem
 *.p12
 credentials.*
+# the source module that shares the name; the ignore stays for credential files
+!packages/mocactl/src/sbx/credentials.ts
 # core.ignorecase (default on macOS/APFS) makes the pattern above match this legitimate
 # component source file too, since it has no secret material — the credential model is
 # write-only end to end. See src/views/overlays/Sessions.tsx, NewSession.tsx, Login.tsx for

@@ -151,6 +151,15 @@ describe('expandPreset', () => {
     ],
   };
 
+  it('throws a programming error, without the secret, when a preset mixes stdin fields', () => {
+    const mixed: Preset = {
+      ...two,
+      credentials: [two.credentials[0]!, { ...two.credentials[1]!, stdinField: 'token' }],
+    };
+    expect(() => expandPreset(mixed, 'work', 's3cret')).toThrow(/mixes stdin fields/);
+    expect(() => expandPreset(mixed, 'work', 's3cret')).not.toThrow(/s3cret/);
+  });
+
   it('names the credentials NAME and NAME-suffix, and carries the binding', () => {
     const out = expandPreset(two, 'work', 's3cret');
     expect(out.map((e) => e.name)).toEqual(['work', 'work-api']);
