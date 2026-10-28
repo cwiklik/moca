@@ -404,6 +404,8 @@ describe('mocactl sbx up and rm: the agent configuration (SBX0 §6.3, plan Revie
     expect(err).toContain('the highlighted default declines');
     expect(err).toContain(`start claude in ${h.r}`);
     expect(err).toContain('not a subdirectory');
+    // The launcher is the way that asks nothing: named here, where the user is looking (#577).
+    expect(err).toContain('mocactl sbx claude');
     // Said with the configuration it refers to: nothing written, nothing to warn about.
     expect(await h.run(['up'])).toBe(0);
     expect(h.err()).not.toContain('Use this MCP server');

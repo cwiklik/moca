@@ -110,6 +110,17 @@ folder, accept that too. Then ask for work as usual ("the tests fail, fix them")
 (`bash`, `read`, `write`, `edit`, `grep`, `find`, `ls` and `sandbox_info`); its local tools are
 denied.
 
+Or start Claude Code through `mocactl` and skip the questions:
+
+```bash
+mocactl sbx claude
+```
+
+The launcher registers the sandbox's MCP server for that one run (`--mcp-config`, nothing
+written, nothing asked), and it works from any directory, not just the root. It is the smaller
+session: `--strict-mcp-config` means Claude Code loads no MCP server but the sandbox's, so run
+`claude` yourself when you want your own servers.
+
 Headless use (scripts, CI) works the same way, without the prompts:
 
 ```bash
@@ -316,6 +327,16 @@ found by searching upwards. Start Claude Code from the repository root, where `u
 files: from a subdirectory the server is still found and still asks, every session, because the
 approval you gave at the root does not apply there. Tracked as
 [#577](https://github.com/rossoctl/moca/issues/577).
+
+**`mocactl sbx claude` asks none of this.** It passes the server with `--mcp-config` —
+flag-scoped, so Claude Code asks no approval and nothing is written anywhere, not even the
+`disabledMcpjsonServers` rejection a past decline left (the flag-scoped server is not the
+project-scoped one that key turns away) — and `--strict-mcp-config` keeps the project-scoped
+copy in `.mcp.json` from asking as well (Claude Code 2.1.246 or later skips that question;
+verified against 2.1.308, at the root, from a subdirectory, and over a past decline). The
+launcher works from any directory for the same reason. The trade: the session loads no MCP
+server but the sandbox's. Run `claude` yourself, answer the two questions once, and every later
+session started in the root has your own servers too and asks nothing.
 
 **To undo it**, delete the sandbox:
 

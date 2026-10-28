@@ -1352,7 +1352,8 @@ export function checkAgentConfig(root: string): string[] {
           `agent has neither the sandbox's tools nor its own; ${
             file === SETTINGS_LOCAL
               ? `delete ${SETTINGS_LOCAL} (mocactl sbx up never writes it) and answer ` +
-                `"${CLAUDE_PROMPT_PICK}" the next time Claude Code asks`
+                `"${CLAUDE_PROMPT_PICK}" the next time Claude Code asks, or start it with ` +
+                `mocactl sbx claude, which loads the server without asking`
               : `remove ${SERVER} from disabledMcpjsonServers in ${SETTINGS}`
           }`,
       );

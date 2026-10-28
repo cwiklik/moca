@@ -387,7 +387,8 @@ export async function cmdUp(
         c.io.err(
           `start claude in ${root} (not a subdirectory); the first session asks about the ` +
             `sandbox MCP server, and the highlighted default declines — choose ` +
-            `"${CLAUDE_PROMPT_PICK}", or mocactl sbx doctor tells you how to undo it`,
+            `"${CLAUDE_PROMPT_PICK}", or start it with mocactl sbx claude, which registers the ` +
+            `server for that run and asks nothing (mocactl sbx doctor tells you how to undo a decline)`,
         );
       }
     } catch (err) {
