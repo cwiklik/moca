@@ -1749,6 +1749,39 @@ out=$(TMPDIR="$EGT/tmp1" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --ima
 case "$out" in *"must run as root"* | *"/dev/kvm is not present"*) ok=yes ;; *) ok=no ;; esac
 check "a good cert passes arg validation" "$ok" "yes"
 
+echo "== SBX0.2b: more than one certificate is refused before staging"
+cat "$EGT/ca.crt" "$EGT/ca.crt" >"$EGT/two.pem"
+mkdir -p "$EGT/tmp2"
+out=$(TMPDIR="$EGT/tmp2" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --image t --egress-ca "$EGT/two.pem" 2>&1); rc=$?
+check "a two-certificate file is refused" "$([ "$rc" != 0 ] && echo yes || echo no)" "yes"
+check "the refusal says more than one certificate" "$(printf '%s' "$out" | grep -c 'more than one certificate')" "1"
+check "nothing was staged for the bundle" "$(find "$EGT/tmp2" -mindepth 1 | wc -l | tr -d ' ')" "0"
+
+echo "== SBX0.2b: the rewrite works on the REAL init heredoc, and anchor drift fails loudly"
+for drift in real drifted; do
+  w="$EGT/real-$drift"; mkdir -p "$w/stage/rootfs-tree/sbin" "$w/stage/rootfs-tree/usr/sbin"
+  printf '#!/bin/sh\necho "$0" >> "%s/calls"\n' "$w" >"$w/stage/rootfs-tree/usr/sbin/update-ca-certificates"
+  chmod 0755 "$w/stage/rootfs-tree/usr/sbin/update-ca-certificates"
+  # The init heredoc body, verbatim from build-snapshot.sh.
+  sed -n "/^  cat >\"\$STAGE\/rootfs-tree\/sbin\/init\" <<'INIT'\$/,/^INIT\$/p" "$SCRIPT" | sed '1d;$d' >"$w/stage/rootfs-tree/sbin/init"
+  [ "$drift" = drifted ] && sed -i.bak 's/^export GITHUB_TOKEN=moca-placeholder$/export GITHUB_TOKEN=changed/' "$w/stage/rootfs-tree/sbin/init"
+  {
+    echo 'chroot() { local t="$1"; shift; local c="$1"; shift; "$t$c" "$@"; }'
+    echo "STAGE='$w/stage'; EGRESS_CA='$EGT/ca.crt'"
+    fn_body install_egress_ca
+    echo 'install_egress_ca'
+  } >"$w/run.sh"
+  bash "$w/run.sh" >"$w/out" 2>&1; rc=$?
+  if [ "$drift" = real ]; then
+    check "real init: rewrite succeeds" "$rc" "0"
+    check "real init: all three exports present" \
+      "$(grep -cE '^export (NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|REQUESTS_CA_BUNDLE)=' "$w/stage/rootfs-tree/sbin/init")" "3"
+  else
+    check "drifted anchor: install_egress_ca fails" "$([ "$rc" != 0 ] && echo yes || echo no)" "yes"
+    check "drifted anchor: the message names the anchor" "$(grep -cF 'export GITHUB_TOKEN=moca-placeholder' "$w/out")" "1"
+  fi
+done
+
 echo "== SBX0.2b: the manifest fingerprint is the DER sha256, outside hash"
 mw="$EGT/mf"; mkdir -p "$mw/stage"
 for mode in with without; do

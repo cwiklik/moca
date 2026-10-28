@@ -209,6 +209,10 @@ validate_egress_ca() {
     echo "build-snapshot.sh: --egress-ca: $EGRESS_CA contains a PRIVATE KEY block; pass the public certificate only" >&2
     exit 2
   fi
+  if [ "$(grep -c -- '-----BEGIN CERTIFICATE-----' "$EGRESS_CA")" -gt 1 ]; then
+    echo "build-snapshot.sh: --egress-ca: $EGRESS_CA holds more than one certificate; the fingerprint covers exactly one, pass a single CA certificate" >&2
+    exit 2
+  fi
   if ! openssl x509 -in "$EGRESS_CA" -noout >/dev/null 2>&1; then
     echo "build-snapshot.sh: --egress-ca: $EGRESS_CA is not a parseable X.509 certificate" >&2
     exit 2
@@ -570,6 +574,15 @@ install_egress_ca() {
   cat "$tmp" >"$init"
   chmod 0555 "$init"
   rm -f "$tmp"
+  # The awk keys on the exact GITHUB_TOKEN line. If that line ever changes, the rewrite
+  # matches nothing and the build would succeed with no CA exports in the guest; fail instead.
+  local v
+  for v in NODE_EXTRA_CA_CERTS SSL_CERT_FILE REQUESTS_CA_BUNDLE; do
+    if ! grep -q "^export $v=" "$init"; then
+      echo "build-snapshot.sh: --egress-ca: the init has no export $v after the rewrite; the anchor line 'export GITHUB_TOKEN=moca-placeholder' in the init heredoc changed" >&2
+      exit 1
+    fi
+  done
 }
 
 assemble_rootfs() {
