@@ -8,12 +8,14 @@
 # Inputs, from the environment only (no arguments):
 #   SBX_API_URL             https://<api host>, the sandbox control plane
 #   SBX_SMOKE_HOME_A        a HOME in which user A ran `mocactl sbx login` (it may be your own HOME)
-#   SBX_SMOKE_HOME_B        a second HOME, logged in as ANOTHER enrolled user (step 2)
+#   SBX_SMOKE_HOME_B        a second HOME, logged in as ANOTHER enrolled user (step 2; required
+#                           unless only step 7 is selected, where it is optional, see below)
 #                           Every mocactl here runs with HOME set to one of them and
 #                           XDG_CONFIG_HOME / XDG_STATE_HOME unset. The smoke never logs in.
 #   SBX_SMOKE_TEMPLATE      the template to create sandboxes from (default: default)
-#   SBX_SMOKE_STEPS         the steps to run, e.g. 1,2,5 (default: all of 1-6; 3 takes ~5 min, 4
-#                           waits for a token's exp, one token lifetime: ~16 min by default)
+#   SBX_SMOKE_STEPS         the steps to run, e.g. 1,2,5 (default: all of 1-7; 3 takes ~5 min, 4
+#                           waits for a token's exp, one token lifetime: ~16 min by default; 7 is a
+#                           SKIP unless its inputs below are set). `7` alone needs only HOME_A.
 #   SBX_SMOKE_AGENTS        the agents step 5 runs, among claude,opencode (default both); one not on
 #                           PATH is a SKIP. Each needs its own login and model already configured.
 #   SBX_SMOKE_HOST          an ssh target ([user@]host) for step 6, the KVM host running the
@@ -29,11 +31,23 @@
 #   MOCACTL                 a mocactl to test (a local build: packages/mocactl/dist/mocactl.mjs);
 #                           unset: installed into a temp dir from the edge channel the user guide
 #                           names (MOCACTL_VERSION=edge scripts/install-mocactl.sh)
+#   SBX_SMOKE_GITHUB_TOKEN_FILE, SBX_SMOKE_GITHUB_REPO
+#                           step 7 (egress credentials; both set, or it is a SKIP): a file holding a
+#                           GitHub PAT (one trailing newline is ignored; the PAT is never taken from
+#                           the environment, which `ps` and child processes can see) and OWNER/REPO, a
+#                           repository the PAT can push to. Needs a sandbox service with
+#                           SBX_EGRESS_CREDENTIALS and curl on this machine.
+#   SBX_SMOKE_CRED_TTL      the egress credential cache TTL in seconds (default 60,
+#                           SH_EGRESS_CREDENTIAL_TTL_SECONDS); step 7 waits TTL + 5 s after a delete
+#   SBX_SMOKE_GITHUB_MCP    1: step 7 also checks the github-mcp preset (api.githubcopilot.com must
+#                           be in the host's egress allowlist)
+#   SBX_SMOKE_CRED_TWO_USERS 1, with SBX_SMOKE_HOME_B: step 7 also checks that user B's sandbox gets
+#                           a 401 and a public clone works; else that check is a SKIP
 #   SBX_SMOKE_PYTHON        Python 3.10+ with grpcio, and grpcio-tools unless the stubs are already
 #                           generated in docs/api/examples (steps 2 and 4; default python3). It also
 #                           runs the sample repository's tests locally.
 #
-# Steps (spec §10.6), each printing `ok N - ...`, `ok N - ... # SKIP why` or `not ok N - ...: why`:
+# Steps (spec §10.6; 7 is SBX0.2b's), each printing `ok N - ...`, `ok N - ... # SKIP why` or `not ok N - ...: why`:
 #   1. round trip: in a sample repository (one failing test), sbx up; sbx run fails the suite;
 #      sbx put the fix; the suite passes in the sandbox; the local tree is unchanged until
 #      sbx pull --apply, after which the suite passes locally.
@@ -54,9 +68,16 @@
 #   6. janitor (SBX_SMOKE_HOST): a deleted sandbox's workspace directory exists on the host; one
 #      janitor run (`sudo ... sbx-janitor.sh`, janitor.env sourced, its own wait kept) frees it once
 #      its deletion is that old (see SBX_SMOKE_JANITOR_AGE).
+#   7. egress credentials (SBX_SMOKE_GITHUB_TOKEN_FILE and SBX_SMOKE_GITHUB_REPO): user A stores the
+#      PAT (`credentials add smoke-gh --preset github`, on stdin from the file, never argv); in A's
+#      sandbox git clone, commit, push of a branch and `gh api user` (else curl) see the PAT's owner;
+#      the remote branch is deleted; the placeholder sent from this machine is a 401; after A deletes
+#      the credential and TTL + 5 s the sandbox gets a 401. Opt-in: github-mcp (no Authorization
+#      header sent by the client, yet `initialize` answers) and B's sandbox (401, public clone ok).
+#      The trap deletes the remote branch, the credentials and the sandboxes. The PAT is never printed.
 #
 # What it creates: temp directories (sample repositories, a mocactl install, token files) and
-# sandboxes it records as it creates them. Each step deletes its own; an EXIT trap deletes whatever
+# credentials (smoke-gh, smoke-gh-mcp), a remote branch sbx-smoke-<ts> and sandboxes it records as it creates them. Each step deletes its own; an EXIT trap deletes whatever
 # is left, on success, failure or interrupt. It deletes nothing it did not create, and never prints a
 # token: tokens go to 0600 files in its temp directory, removed at exit. Logs are kept (path printed)
 # when something failed.
@@ -93,24 +114,43 @@ PROMPT='The test suite fails (python3 -m unittest). Fix it with a minimal change
 
 [[ -n "${SBX_API_URL:-}" ]] || die "set SBX_API_URL=https://<api host> (the sandbox control plane)"
 [[ "$SBX_API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]] || die "SBX_API_URL must be https://<api host> (got '$SBX_API_URL')"
-for v in SBX_SMOKE_HOME_A SBX_SMOKE_HOME_B; do
-  [[ -n "${!v:-}" ]] || die "set $v to a HOME already logged in with \`mocactl sbx login\` (see deploy/sbx/RUNBOOK.md, Live smoke)"
-  [[ -d "${!v}" ]] || die "$v='${!v}' is not a directory"
-done
+homecheck() { # homecheck VAR: a set variable naming a directory
+  [[ -n "${!1:-}" ]] || die "set $1 to a HOME already logged in with \`mocactl sbx login\` (see deploy/sbx/RUNBOOK.md, Live smoke)"
+  [[ -d "${!1}" ]] || die "$1='${!1}' is not a directory"
+}
+homecheck SBX_SMOKE_HOME_A
 HOME_A="$(cd "$SBX_SMOKE_HOME_A" && pwd -P)"
-HOME_B="$(cd "$SBX_SMOKE_HOME_B" && pwd -P)"
-[[ "$HOME_A" != "$HOME_B" ]] || die 'SBX_SMOKE_HOME_A and SBX_SMOKE_HOME_B are the same directory: user B needs a login of its own'
 TEMPLATE="${SBX_SMOKE_TEMPLATE:-default}"
 [[ "$TEMPLATE" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "SBX_SMOKE_TEMPLATE='$TEMPLATE' is not a template id"
 
 STEPS=' '
-IFS=, read -ra raw <<<"${SBX_SMOKE_STEPS-1,2,3,4,5,6}"
-((${#raw[@]})) || die 'SBX_SMOKE_STEPS is empty: list steps 1-6, e.g. 1,2,5'
+IFS=, read -ra raw <<<"${SBX_SMOKE_STEPS-1,2,3,4,5,6,7}"
+((${#raw[@]})) || die 'SBX_SMOKE_STEPS is empty: list steps 1-7, e.g. 1,2,5'
 for s in "${raw[@]}"; do
-  [[ "$s" =~ ^[1-6]$ ]] || die "SBX_SMOKE_STEPS: '$s' is not a step (1-6, comma-separated)"
+  [[ "$s" =~ ^[1-7]$ ]] || die "SBX_SMOKE_STEPS: '$s' is not a step (1-7, comma-separated)"
   STEPS+="$s "
 done
 want() { [[ "$STEPS" == *" $1 "* ]]; }
+
+# Step 7's inputs. Both set: it runs; else it is a SKIP. User B is needed by steps 1-6 (as ever) and by
+# step 7 only when it is asked for twice over (SBX_SMOKE_CRED_TWO_USERS=1 and a HOME_B).
+CRED_FILE="${SBX_SMOKE_GITHUB_TOKEN_FILE:-}" CRED_REPO="${SBX_SMOKE_GITHUB_REPO:-}"
+CRED_TTL="${SBX_SMOKE_CRED_TTL:-60}"
+CRED_ON=0 CRED_B=0 NEED_B=0
+for s in 1 2 3 4 5 6; do ! want "$s" || NEED_B=1; done
+if want 7 && [[ -n "$CRED_FILE" && -n "$CRED_REPO" ]]; then
+  CRED_ON=1
+  [[ "$CRED_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "SBX_SMOKE_GITHUB_REPO='$CRED_REPO' must be OWNER/REPO"
+  [[ -f "$CRED_FILE" && -r "$CRED_FILE" && -s "$CRED_FILE" ]] || die 'SBX_SMOKE_GITHUB_TOKEN_FILE is not a readable, non-empty file'
+  [[ "$CRED_TTL" =~ ^[1-9][0-9]{0,4}$ ]] || die "SBX_SMOKE_CRED_TTL='$CRED_TTL' must be whole seconds"
+  if [[ "${SBX_SMOKE_CRED_TWO_USERS:-}" == 1 && -n "${SBX_SMOKE_HOME_B:-}" ]]; then CRED_B=1; NEED_B=1; fi
+fi
+HOME_B=''
+if ((NEED_B)); then
+  homecheck SBX_SMOKE_HOME_B
+  HOME_B="$(cd "$SBX_SMOKE_HOME_B" && pwd -P)"
+  [[ "$HOME_A" != "$HOME_B" ]] || die 'SBX_SMOKE_HOME_A and SBX_SMOKE_HOME_B are the same directory: user B needs a login of its own'
+fi
 
 AGENTS=''
 IFS=, read -ra raw <<<"${SBX_SMOKE_AGENTS-claude,opencode}"
@@ -139,7 +179,7 @@ WORK="$(mktemp -d)"
 LOGS="$(mktemp -d)"
 chmod 700 "$WORK" "$LOGS"
 RUN="smoke-$(date +%s)-$$"
-CREATED_A='' CREATED_B='' PIDS=''
+CREATED_A='' CREATED_B='' PIDS='' CRED_NAMES='' BRANCH=''
 PASSES=0 FAILS=0 SKIPS=0
 
 cleanup() {
@@ -147,6 +187,9 @@ cleanup() {
   set +e
   # shellcheck disable=SC2086 # a list of pids
   [[ -z "$PIDS" ]] || kill $PIDS 2>/dev/null
+  # Step 7's leftovers first: the branch needs the PAT (read from its file), not a sandbox.
+  if [[ -n "$BRANCH" ]]; then drop_branch || rc=1; fi
+  for id in $CRED_NAMES; do left_cred "$id" || rc=1; done
   for id in $CREATED_A; do left a "$id" || rc=1; done
   for id in $CREATED_B; do left b "$id" || rc=1; done
   # A create the server carried out but whose id never reached us (an interrupt, a lost answer):
@@ -173,6 +216,26 @@ left() { # left a|b ID: delete a sandbox this run created and a step did not
     return 1
   fi
 }
+left_cred() { # left_cred NAME: delete a credential this run stored and a step did not
+  if as a credentials delete "$1" >>"$LOGS/cleanup.log" 2>&1 </dev/null; then
+    echo "# cleanup: deleted credential $1 (user A)"
+  else
+    echo "# cleanup: could not delete credential $1 (user A): delete it with \`mocactl sbx credentials delete $1\`"
+    return 1
+  fi
+}
+# The PAT, read from its file inside a function and handed to curl on stdin as a config line: not
+# in argv, not in the environment, never echoed. One trailing newline is dropped.
+pat() { local t; t="$(cat "$CRED_FILE"; printf x)" && t="${t%x}" && printf '%s' "${t%$'\n'}"; }
+pat_curl() { printf 'user = "x-access-token:%s"\n' "$(pat)" | curl -sS -K - "$@"; }
+drop_branch() { # delete the remote branch from this machine; a branch that is not there is fine
+  local code
+  code="$(pat_curl -X DELETE -o /dev/null -w '%{http_code}' "https://api.github.com/repos/$CRED_REPO/git/refs/heads/$BRANCH" 2>>"$LOGS/cleanup.log")" || code=''
+  case "$code" in
+  204 | 404 | 422) echo "# cleanup: deleted remote branch $BRANCH"; BRANCH='' ;;
+  *) echo "# cleanup: could not delete the remote branch $BRANCH of $CRED_REPO (HTTP ${code:-none}): delete it by hand"; return 1 ;;
+  esac
+}
 upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -198,6 +261,7 @@ esac
 for u in a b; do
   home="$HOME_A"
   [[ "$u" == a ]] || home="$HOME_B"
+  [[ -n "$home" ]] || continue
   mkdir -p "$WORK/bin-$u"
   printf '#!/usr/bin/env bash\nexport HOME=%q MOCACTL_SBX_URL=%q\nunset XDG_CONFIG_HOME XDG_STATE_HOME\nexec %s "$@"\n' \
     "$home" "$SBX_API_URL" "$RUNNER" >"$WORK/bin-$u/mocactl"
@@ -364,13 +428,13 @@ in_repo() { local r="$1" old="$PWD"; shift; cd "$r" || { RC=1; return 0; }; "$@"
 
 x ls-a as a ls
 [[ "$RC" == 0 ]] || die "user A (SBX_SMOKE_HOME_A) cannot list sandboxes: $(lastline "$LOGS/ls-a.err") (see deploy/sbx/RUNBOOK.md, Live smoke)"
-if want 2; then
+if want 2 || ((CRED_B)); then
   x ls-b as b ls
   [[ "$RC" == 0 ]] || die "user B (SBX_SMOKE_HOME_B) cannot list sandboxes: $(lastline "$LOGS/ls-b.err")"
   # The login's subject only; the file's tokens are never read out.
   subject() { "$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("subject", ""))' "$1/.config/mocactl/sbx-auth.json" 2>/dev/null || true; }
   sa="$(subject "$HOME_A")" sb="$(subject "$HOME_B")"
-  [[ -z "$sa" || "$sa" != "$sb" ]] || die "SBX_SMOKE_HOME_A and SBX_SMOKE_HOME_B are both logged in as $sa: step 2 needs two users"
+  [[ -z "$sa" || "$sa" != "$sb" ]] || die "SBX_SMOKE_HOME_A and SBX_SMOKE_HOME_B are both logged in as $sa: this check needs two users"
 fi
 echo "# SBX0 live smoke: $SBX_API_URL, template $TEMPLATE, steps${STEPS% }, run $RUN"
 
@@ -612,6 +676,78 @@ step6() {
     fail "$dir is still there after the run: $(grep '"janitor":"summary"' "$LOGS/janitor.out" | tr -cd '[:print:]' | cut -c1-200)" || return 1
 }
 
+# Step 7. The sandbox commands carry no PAT: git and gh/curl in the sandbox send the placeholder,
+# and the host's egress proxy puts the real credential on the wire.
+SANDBOX_LOGIN='if command -v gh >/dev/null; then gh api user --jq .login; else curl -sS -H "Authorization: Bearer ${GH_TOKEN:-moca-placeholder}" https://api.github.com/user | python3 -c "import json,sys; print(json.load(sys.stdin)[\"login\"])"; fi'
+SANDBOX_CODE='curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${GH_TOKEN:-moca-placeholder}" https://api.github.com/user'
+cred_add() { # cred_add NAME PRESET: user A stores the PAT, on stdin from the file
+  CRED_NAMES+=" $1" # recorded first: an add whose answer was lost is deleted by the trap
+  xin "cred-add-$1" "$CRED_FILE" as a credentials add "$1" --preset "$2"
+  [[ "$RC" == 0 ]] || fail "sbx credentials add $1 --preset $2: exit $RC: $(lastline "$LOGS/cred-add-$1.err")"
+}
+cred_del() { # cred_del NAME
+  x "cred-del-$1" as a credentials delete "$1"
+  [[ "$RC" == 0 ]] || fail "sbx credentials delete $1: exit $RC: $(lastline "$LOGS/cred-del-$1.err")" || return 1
+  local l=" $CRED_NAMES "
+  CRED_NAMES="${l/ $1 / }"
+}
+sbx_sh() { # sbx_sh NAME ID SCRIPT: sh -c SCRIPT in a sandbox, as user A (or B, with WHO=b)
+  x "$1" as "${WHO:-a}" run --sandbox "$2" --timeout 180 -- sh -c "$3"
+}
+step7() {
+  ((CRED_ON)) || { WHY='SBX_SMOKE_GITHUB_TOKEN_FILE and SBX_SMOKE_GITHUB_REPO not both set'; return 3; }
+  command -v curl >/dev/null || fail 'step 7 needs curl on PATH' || return 1
+  local owner id d="smoke-$RUN" code
+  owner="$(pat_curl https://api.github.com/user 2>"$LOGS/owner.err" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["login"])' 2>>"$LOGS/owner.err")" || owner=''
+  [[ "$owner" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]] || fail "api.github.com/user did not accept the PAT in SBX_SMOKE_GITHUB_TOKEN_FILE: $(lastline "$LOGS/owner.err")" || return 1
+  cred_add smoke-gh github || return 1
+  create a credentials || return 1
+  id="$SBX"
+  # Clone, commit, push a branch: the credential rides git over HTTPS; the sandbox holds none.
+  BRANCH="sbx-smoke-$(date +%s)"
+  sbx_sh cred-git "$id" "set -e; rm -rf $d; git clone -q https://github.com/$CRED_REPO $d; cd $d; git -c user.name=sbx-smoke -c user.email=sbx-smoke@localhost -c commit.gpgsign=false commit -q --allow-empty -m 'sbx smoke'; git push -q origin HEAD:refs/heads/$BRANCH"
+  [[ "$RC" == 0 ]] || fail "git clone / commit / push in the sandbox: exit $RC: $(lastline "$LOGS/cred-git.err")" || return 1
+  sbx_sh cred-login "$id" "$SANDBOX_LOGIN"
+  [[ "$RC" == 0 && "$(lastline "$LOGS/cred-login.out")" == "$owner" ]] ||
+    fail "the sandbox's api.github.com/user login is not the PAT's owner (exit $RC): got '$(lastline "$LOGS/cred-login.out")' $(lastline "$LOGS/cred-login.err")" || return 1
+  sbx_sh cred-delbranch "$id" "set -e; cd $d; git push -q origin --delete $BRANCH"
+  [[ "$RC" == 0 ]] || fail "deleting the remote branch from the sandbox: exit $RC: $(lastline "$LOGS/cred-delbranch.err")" || return 1
+  BRANCH=''
+  # The placeholder is inert off the proxy.
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer moca-placeholder' https://api.github.com/user 2>"$LOGS/cred-placeholder.err" </dev/null)" || true
+  [[ "$code" == 401 ]] || fail "the placeholder sent from this machine to api.github.com/user got '${code:-none}', not 401" || return 1
+  # User B has no credential: the same call is a 401, and a public clone works.
+  if ((CRED_B)); then
+    create b credentials-b || return 1
+    local bid="$SBX"
+    WHO=b sbx_sh cred-b-code "$bid" "$SANDBOX_CODE"
+    [[ "$RC" == 0 && "$(lastline "$LOGS/cred-b-code.out")" == 401 ]] ||
+      fail "user B's sandbox got '$(lastline "$LOGS/cred-b-code.out")' from api.github.com/user, not 401" || return 1
+    WHO=b sbx_sh cred-b-public "$bid" 'git ls-remote https://github.com/cli/cli HEAD'
+    [[ "$RC" == 0 ]] || fail "a public git ls-remote in user B's sandbox: exit $RC: $(lastline "$LOGS/cred-b-public.err")" || return 1
+    release b "$bid" || return 1
+  else
+    echo "ok 7 - B's sandbox gets a 401 and a public clone works # SKIP no second user"
+    SKIPS=$((SKIPS + 1))
+  fi
+  # Revocation: after the delete and the egress cache TTL, the sandbox is a 401.
+  cred_del smoke-gh || return 1
+  echo "# step 7: waiting $((CRED_TTL + 5)) s for the egress credential cache..."
+  job sleep $((CRED_TTL + 5))
+  sbx_sh cred-revoked "$id" "$SANDBOX_CODE"
+  [[ "$RC" == 0 && "$(lastline "$LOGS/cred-revoked.out")" == 401 ]] ||
+    fail "after the delete and $((CRED_TTL + 5)) s the sandbox got '$(lastline "$LOGS/cred-revoked.out")' from api.github.com/user, not 401" || return 1
+  if [[ "${SBX_SMOKE_GITHUB_MCP:-}" == 1 ]]; then
+    cred_add smoke-gh-mcp github-mcp || return 1
+    # No Authorization header from the client: the host sets it.
+    sbx_sh cred-mcp "$id" "curl --http1.1 -sS -X POST https://api.githubcopilot.com/mcp/ -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"sbx-smoke\",\"version\":\"0\"}}}'"
+    grep -q serverInfo "$LOGS/cred-mcp.out" ||
+      fail "the github-mcp initialize without an Authorization header returned no serverInfo (exit $RC): $(lastline "$LOGS/cred-mcp.out")" || return 1
+    cred_del smoke-gh-mcp || return 1
+  fi
+  release a "$id"
+}
+
 run_step() { # run_step N TITLE FN [ARG]
   local n="$1" title="$2" rc=0
   shift 2
@@ -641,6 +777,8 @@ else
   run_step 5 'agents fix the failing test through mocactl sbx mcp' :
 fi
 run_step 6 "the janitor frees a deleted sandbox's directory" step6
+
+run_step 7 'egress credentials: the PAT works from the sandbox without being in it; the placeholder is inert; delete revokes' step7
 
 echo "# $PASSES ok, $FAILS not ok, $SKIPS skipped"
 ((FAILS == 0)) || exit 1

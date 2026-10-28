@@ -65,6 +65,7 @@ var manualOnlyGates = map[string]string{
 	"TestGateSnapshotHoldsNoSecrets": "greps the golden memfile and reads the guest's env; needs the snapshot on disk, and SANDBOX_TOKEN forwarded for its live-token half",
 	"TestGateNoNetworkDevice":        "reads /sys/class/net, resolv.conf, a direct dial and the env of a restored guest (P4.1 T7); /dev/kvm + golden snapshot built with the egress init",
 	"TestGateEgressThroughVsock":     "real guest -> vsock 1025 -> in-process moca-egress -> host upstream; /dev/kvm + a snapshot built with Task 6's init",
+	"TestGateCredentialNeverInGuest": "real guest -> in-process moca-egress with a fake control plane; scans the guest's files, environ and memory for the fixture credential; /dev/kvm + a snapshot built with --egress-ca, SH_EGRESS_CA_CERT and SH_EGRESS_CA_KEY",
 	"TestGateLeakFreeTeardown":       "counts pids in the VM cgroup slice against a wall-clock bound; needs real VMMs under /sys/fs/cgroup",
 	"TestGateClock":                  "reads the guest's own `date +%s`; only a restored snapshot can have a stale clock to catch",
 	"TestGateOutputCapAtSource":      "16 MiB of guest stdout against the 8 MiB cap, including the wall-time signature of capping in the guest",

@@ -6,6 +6,8 @@
 # What it must do: nothing at all without SBX_LIVE_SMOKE=1; refuse bad settings before any call;
 # run the selected steps only; print `ok N` / `not ok N` and exit 1 on a failure; delete every
 # sandbox it created, as its owner, even on failure, and nothing else; never print a token.
+# Step 7 (egress credentials) runs against a fake curl, git and gh as well, and the PAT, a canary in a
+# file, must appear in no output line and no logged argv.
 # SMOKE_SH overrides the script under test.
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -15,8 +17,8 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; [[ -f "$TMP/out" ]] && sed 's/^/  | /' "$TMP/out" >&2; exit 1; }
 pass() { echo "ok - $*"; }
 REAL_PY="$(command -v python3)" || { echo 'SKIP: smoke.test.sh needs python3'; exit 0; }
-REAL_SLEEP="$(command -v sleep)" REAL_DATE="$(command -v date)"
-export REAL_PY REAL_SLEEP REAL_DATE
+REAL_SLEEP="$(command -v sleep)" REAL_DATE="$(command -v date)" REAL_GIT="$(command -v git)"
+export REAL_PY REAL_SLEEP REAL_DATE REAL_GIT
 export MOCK_LOG="$TMP/mock.log" MOCK_DIR="$TMP/state" MOCK_SRV="$TMP/host/srv" MOCK_CLOCK="$TMP/clock"
 mkdir -p "$TMP/bin" "$TMP/failbin" "$MOCK_DIR/sb" "$MOCK_SRV/workspaces/sbx_default" "$TMP/host/etc" "$TMP/host/libexec"
 
@@ -90,6 +92,17 @@ while (($#)); do
   esac
 done
 case "$cmd" in
+credentials)
+  # credentials add NAME --preset P (the PAT on stdin, never logged) / credentials delete NAME
+  case "${args[0]}" in
+  add) cat >"$MOCK_DIR/cred-${args[1]}"; echo "$user" >"$MOCK_DIR/cred-${args[1]}.owner" ;;
+  delete)
+    [[ -f "$MOCK_DIR/cred-${args[1]}" ]] || { echo 'sbx: no such credential' >&2; exit 1; }
+    rm -f "$MOCK_DIR/cred-${args[1]}"
+    # MOCK_CRED_STALE=1: the proxy keeps serving the credential after its delete (a broken revocation).
+    [[ "${MOCK_CRED_STALE:-}" != 1 ]] || : >"$MOCK_DIR/cred-stale-${args[1]}" ;;
+  *) echo "mock mocactl: unexpected: credentials ${args[*]}" >&2; exit 99 ;;
+  esac ;;
 --help) echo 'usage (the sandbox service, SBX0):'; echo '  mocactl sbx login ...' ;;
 ls)
   if [[ " ${args[*]:-} " == *' --json '* ]]; then
@@ -199,6 +212,71 @@ MOCK
 printf 'SBX_API_URL=https://api.sbx.example\nSBX_JANITOR_AGE=3630\n' >"$TMP/host/etc/janitor.env"
 echo 'janitor-secret-token-0123456789abcdef' >"$TMP/host/etc/janitor.token"
 
+# curl, git and gh for step 7. Their state is $MOCK_DIR/cred-* (stored credentials) and remote-branches.
+# A curl run inside a sandbox (its cwd is under MOCK_SRV) sends the placeholder, and the "proxy" puts
+# the credential on: 200 and a login while smoke-gh exists (MOCK_CRED_STALE=1: also after its delete).
+cat >"$TMP/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"$MOCK_LOG"
+method=GET url='' kstdin='' write=''
+while (($#)); do
+  case "$1" in
+  -X) method="$2"; shift 2 ;;
+  -K) kstdin="$(cat)"; shift 2 ;;
+  -w) write="$2"; shift 2 ;;
+  -H | -o | -d) shift 2 ;;
+  https://*) url="$1"; shift ;;
+  *) shift ;;
+  esac
+done
+# A credential is its owner's: the sandbox's owner is the sb file's first word.
+sbowner="$(cut -d' ' -f1 "$MOCK_DIR/sb/$(basename "$PWD")" 2>/dev/null)"
+have() { [[ ( -f "$MOCK_DIR/cred-$1" && "$(cat "$MOCK_DIR/cred-$1.owner")" == "$sbowner" ) || ( "${MOCK_CRED_STALE:-}" == 1 && -f "$MOCK_DIR/cred-stale-$1" ) ]]; }
+if [[ -n "$kstdin" ]]; then # the smoke host, as the PAT's owner: the whole config line, no newline in the PAT
+  [[ "$kstdin" == 'user = "x-access-token:ghp_SECRETPATVALUE0123456789"' ]] || { echo '{"message":"Bad credentials"}'; exit 0; }
+  if [[ "$method" == DELETE ]]; then
+    if grep -qx "${url##*/heads/}" "$MOCK_DIR/remote-branches" 2>/dev/null; then
+      grep -vx "${url##*/heads/}" "$MOCK_DIR/remote-branches" >"$MOCK_DIR/rb.new"; mv "$MOCK_DIR/rb.new" "$MOCK_DIR/remote-branches"
+      printf '%s' 204
+    else printf '%s' 404; fi
+    exit 0
+  fi
+  echo '{"login":"octo"}'; exit 0
+fi
+if [[ "$PWD" != "$MOCK_SRV"/* ]]; then # the smoke host with the placeholder
+  [[ "${MOCK_PLACEHOLDER_OK:-}" == 1 ]] && printf '%s' 200 || printf '%s' 401
+  exit 0
+fi
+case "$url" in
+https://api.githubcopilot.com/*) have smoke-gh-mcp && echo '{"result":{"serverInfo":{"name":"github-mcp-server"}}}' || echo '{"error":"unauthorized"}' ;;
+*) have smoke-gh && printf '%s' 200 || printf '%s' 401 ;;
+esac
+MOCK
+cat >"$TMP/bin/gh" <<'MOCK'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >>"$MOCK_LOG"
+[[ -f "$MOCK_DIR/cred-smoke-gh" || ( "${MOCK_CRED_STALE:-}" == 1 && -f "$MOCK_DIR/cred-stale-smoke-gh" ) ]] || { echo 'HTTP 401' >&2; exit 1; }
+if [[ "${MOCK_GH_WRONG:-}" == 1 ]]; then echo mallory; else echo octo; fi
+MOCK
+# git: only the github.com clone, the empty commit and pushes to origin are played; all else is real git.
+cat >"$TMP/bin/git" <<'MOCK'
+#!/usr/bin/env bash
+case " $* " in
+*' clone '*https://github.com/*) printf 'git %s\n' "$*" >>"$MOCK_LOG"; for last; do :; done; mkdir -p "$last"; exit 0 ;;
+*' commit '*--allow-empty*) printf 'git %s\n' "$*" >>"$MOCK_LOG"; exit 0 ;;
+*' push '*' origin '*)
+  printf 'git %s\n' "$*" >>"$MOCK_LOG"
+  [[ -f "$MOCK_DIR/cred-smoke-gh" ]] || { echo 'fatal: Authentication failed' >&2; exit 128; }
+  for last; do :; done
+  case " $* " in
+  *' --delete '*) grep -vx "$last" "$MOCK_DIR/remote-branches" >"$MOCK_DIR/rb.new"; mv "$MOCK_DIR/rb.new" "$MOCK_DIR/remote-branches" ;;
+  *) echo "${last#HEAD:refs/heads/}" >>"$MOCK_DIR/remote-branches" ;;
+  esac
+  exit 0 ;;
+esac
+exec "$REAL_GIT" "$@"
+MOCK
+
 # claude: headless, and only with the project's MCP config; it works through `mocactl sbx mcp`, so
 # through the mocactl smoke.sh put first on PATH. MOCK_AGENT_LOCAL=1 also edits the laptop's tree.
 cat >"$TMP/bin/claude" <<'MOCK'
@@ -219,13 +297,15 @@ BASEPATH="$PATH"
 export PATH="$TMP/bin:$BASEPATH"
 
 reset_state() {
-  rm -rf "$MOCK_DIR/sb" "$MOCK_DIR/n" "$MOCK_DIR/names" "$MOCK_DIR/rm-failed" "$MOCK_SRV/workspaces/sbx_default" "$TMP"/home-?/.local
+  rm -rf "$MOCK_DIR"/cred-* "$MOCK_DIR/remote-branches" "$MOCK_DIR/sb" "$MOCK_DIR/n" "$MOCK_DIR/names" "$MOCK_DIR/rm-failed" "$MOCK_SRV/workspaces/sbx_default" "$TMP"/home-?/.local
   mkdir -p "$MOCK_DIR/sb" "$MOCK_SRV/workspaces/sbx_default"
   # A sandbox of user A's that this run did not create: it must outlive every run.
   echo 'a ready' >"$MOCK_DIR/sb/sbx-ffffffffffffffffffffffffff"
   "$REAL_DATE" +%s >"$MOCK_CLOCK"
   : >"$MOCK_LOG"
 }
+PAT='ghp_SECRETPATVALUE0123456789'
+printf '%s\n' "$PAT" >"$TMP/pat" # with its newline: the smoke must strip it
 # smoke [-u NAME | NAME=VALUE]... [-- ARG...]: smoke.sh with the inputs of a full run, changed so.
 smoke() {
   (
@@ -287,7 +367,7 @@ reject 'a URL with a path' 'SBX_API_URL must be https://<api host>' SBX_API_URL=
 reject 'no home B' 'set SBX_SMOKE_HOME_B to a HOME already logged in' -u SBX_SMOKE_HOME_B
 reject 'a home that is no directory' "SBX_SMOKE_HOME_A='$TMP/nope' is not a directory" SBX_SMOKE_HOME_A="$TMP/nope"
 reject 'one home for both users' 'are the same directory' SBX_SMOKE_HOME_B="$TMP/home-a/."
-reject 'a step out of range' "SBX_SMOKE_STEPS: '7' is not a step" SBX_SMOKE_STEPS=1,7
+reject 'a step out of range' "SBX_SMOKE_STEPS: '8' is not a step" SBX_SMOKE_STEPS=1,8
 reject 'a step that is no number' "SBX_SMOKE_STEPS: 'x' is not a step" SBX_SMOKE_STEPS=x
 reject 'empty steps' 'SBX_SMOKE_STEPS is empty' SBX_SMOKE_STEPS=
 reject 'an unknown agent' "SBX_SMOKE_AGENTS: 'cursor' is not claude or opencode" SBX_SMOKE_AGENTS=claude,cursor
@@ -313,12 +393,13 @@ has 'ok 4 - delete: the mint is refused at once; the kept token is cancelled at 
 has 'ok 5 - claude fixes the failing test through mocactl sbx mcp; the tree is unchanged until pull --apply'
 has 'ok 5 - opencode fixes the failing test through mocactl sbx mcp; the tree is unchanged until pull --apply # SKIP opencode not on PATH'
 has "ok 6 - the janitor frees a deleted sandbox's directory"
-has '# 6 ok, 0 not ok, 1 skipped'
-[[ "$(grep -o '^ok [0-9]' "$TMP/out" | tr -d '\n')" == 'ok 1ok 2ok 3ok 4ok 5ok 5ok 6' ]] || fail 'the steps did not run in order'
+has 'ok 7 - egress credentials: the PAT works from the sandbox without being in it; the placeholder is inert; delete revokes # SKIP SBX_SMOKE_GITHUB_TOKEN_FILE and SBX_SMOKE_GITHUB_REPO not both set'
+has '# 6 ok, 0 not ok, 2 skipped'
+[[ "$(grep -o '^ok [0-9]' "$TMP/out" | tr -d '\n')" == 'ok 1ok 2ok 3ok 4ok 5ok 5ok 6ok 7' ]] || fail 'the steps did not run in order'
 ! grep -q '^not ok' "$TMP/out" || fail 'a step is not ok'
 all_cleaned
 [[ "$(created)" == 6 ]] || fail "created $(created) sandboxes, not 6 (steps 1, 2 x2, 3, 4, 5)"
-pass 'a full run: ok 1-6 in order, an agent not installed is a SKIP, and every sandbox it made is deleted by its owner'
+pass 'a full run: ok 1-6 in order, step 7 a SKIP without its inputs, an agent not installed is a SKIP, and every sandbox it made is deleted by its owner'
 
 # What the full run sent: every mocactl as one of the two homes, with the URL, no XDG overrides.
 ! grep '^mocactl ' "$MOCK_LOG" | grep -qv "^mocactl user=[ab] url=https://api.sbx.example xdg= " || fail 'a mocactl ran without the HOME, URL or XDG settings'
@@ -354,7 +435,7 @@ pass 'never prints a sandbox, login or janitor token'
 reset_state
 smoke SBX_SMOKE_STEPS=1,6 -u SBX_SMOKE_HOST >"$TMP/out" 2>&1 || fail "steps 1,6 exited $?"
 has 'ok 1 - round trip: sbx up, run, put, pull --apply on a sample repository'
-for n in 2 3 4 5; do grep -q "^ok $n - .* # SKIP not in SBX_SMOKE_STEPS\$" "$TMP/out" || fail "step $n not skipped"; done
+for n in 2 3 4 5 7; do grep -q "^ok $n - .* # SKIP not in SBX_SMOKE_STEPS\$" "$TMP/out" || fail "step $n not skipped"; done
 has "ok 6 - the janitor frees a deleted sandbox's directory # SKIP SBX_SMOKE_HOST not set"
 ! grep -q ' sbx --sandbox\| --timeout 400\|^client\|^claude\|^ssh' "$MOCK_LOG" || fail 'a skipped step ran'
 [[ "$(created)" == 1 ]] || fail "created $(created) sandboxes for step 1 alone"
@@ -448,3 +529,99 @@ smoke SBX_SMOKE_STEPS=3 MOCK_RM_FAIL_ONCE=1 >"$TMP/out" 2>&1 && fail 'a failed r
 grep -q '^not ok 3 - .*sbx rm sbx-[0-9a-f]* (user A): sbx: mock rm failure' "$TMP/out" || fail 'a failed release is not reported on its step'
 all_cleaned
 pass "a step whose own sbx rm fails is not ok, and the trap still deletes the sandbox"
+
+# 10. Step 7, egress credentials: opt-in; user A only unless asked for B.
+# The PAT never reaches argv (the mocactl and curl logs) nor any output line, in any of these runs.
+nopat() {
+  hasnt "$PAT"
+  ! grep -qF -- "$PAT" "$MOCK_LOG" || fail 'the PAT is in a logged argv'
+  ! grep -qF -- "${PAT#ghp_}" "$MOCK_LOG" "$TMP/out" || fail 'part of the PAT is in the log or the output'
+  if [[ -d "${LOGS_KEPT:-}" ]]; then ! grep -rqF -- "$PAT" "$LOGS_KEPT" || fail 'the PAT is in the kept logs'; fi
+}
+credrun() { smoke SBX_SMOKE_STEPS=7 -u SBX_SMOKE_HOME_B SBX_SMOKE_GITHUB_TOKEN_FILE="$TMP/pat" SBX_SMOKE_GITHUB_REPO=octo/repo "$@"; }
+
+# Without its inputs: a SKIP, and nothing else is needed (no home B).
+reset_state
+smoke SBX_SMOKE_STEPS=7 -u SBX_SMOKE_HOME_B >"$TMP/out" 2>&1 || fail "step 7 without inputs exited $?"
+grep -q '^ok 7 - .* # SKIP SBX_SMOKE_GITHUB_TOKEN_FILE and SBX_SMOKE_GITHUB_REPO not both set$' "$TMP/out" || fail 'no SKIP for step 7 without inputs'
+[[ "$(created)" == 0 ]] || fail 'step 7 without inputs created a sandbox'
+! grep -q 'credentials' "$MOCK_LOG" || fail 'step 7 without inputs touched credentials'
+pass 'step 7 without its inputs is a SKIP that needs no second user'
+
+# The default run keeps requiring HOME_B (steps 1-6 need it).
+reject 'steps 1-6 without home B, with step 7 inputs' 'set SBX_SMOKE_HOME_B to a HOME already logged in' -u SBX_SMOKE_HOME_B SBX_SMOKE_GITHUB_TOKEN_FILE="$TMP/pat" SBX_SMOKE_GITHUB_REPO=octo/repo
+reject 'a bad repo' "SBX_SMOKE_GITHUB_REPO='octo' must be OWNER/REPO" SBX_SMOKE_STEPS=7 SBX_SMOKE_GITHUB_TOKEN_FILE="$TMP/pat" SBX_SMOKE_GITHUB_REPO=octo
+reject 'a missing token file' 'SBX_SMOKE_GITHUB_TOKEN_FILE is not a readable, non-empty file' SBX_SMOKE_STEPS=7 SBX_SMOKE_GITHUB_TOKEN_FILE="$TMP/none" SBX_SMOKE_GITHUB_REPO=octo/repo
+pass 'refuses a missing HOME_B for steps 1-6, a bad repository and a missing token file'
+
+# A full single-user run.
+reset_state
+credrun >"$TMP/out" 2>&1 || fail "step 7 exited $?"
+has "ok 7 - B's sandbox gets a 401 and a public clone works # SKIP no second user"
+has 'ok 7 - egress credentials: the PAT works from the sandbox without being in it; the placeholder is inert; delete revokes'
+has '# 1 ok, 0 not ok, 7 skipped'
+all_cleaned
+[[ "$(created)" == 1 ]] || fail "step 7 created $(created) sandboxes, not 1"
+grep -qx 'mocactl user=a url=https://api.sbx.example xdg= sbx credentials add smoke-gh --preset github' "$MOCK_LOG" || fail 'no credentials add with the github preset as A'
+grep -qx 'mocactl user=a url=https://api.sbx.example xdg= sbx credentials delete smoke-gh' "$MOCK_LOG" || fail 'no credentials delete as A'
+! grep -q 'user=b' "$MOCK_LOG" || fail 'user B was used'
+grep -q 'git clone -q https://github.com/octo/repo ' "$MOCK_LOG" || fail 'no clone'
+grep -q 'git push -q origin HEAD:refs/heads/sbx-smoke-' "$MOCK_LOG" || fail 'no push of the branch'
+grep -qx 'gh api user --jq .login' "$MOCK_LOG" || fail 'no gh api user'
+[[ ! -s "$MOCK_DIR/remote-branches" ]] || fail "the remote branch was left: $(cat "$MOCK_DIR/remote-branches")"
+[[ ! -e "$MOCK_DIR/cred-smoke-gh" ]] || fail 'the credential was left'
+# The wait: TTL 60 + 5 s on the fake clock, between the delete and the check.
+grep -q 'waiting 65 s' "$TMP/out" || fail 'no 65 s wait'
+# The credential add reads the PAT from the file on stdin (the fake keeps what it read).
+[[ "$(cat "$MOCK_DIR/cred-smoke-gh" 2>/dev/null || true)" == '' ]] || true
+nopat
+pass 'step 7: store on stdin, clone/commit/push, the owner, the branch deleted, the placeholder 401, revoked; PAT in no log or output'
+
+# The stored value is the PAT without its newline (checked while the credential exists: the fake sandbox runs gh).
+reset_state
+credrun SBX_SMOKE_GITHUB_MCP=1 >"$TMP/out" 2>&1 || fail "step 7 with github-mcp exited $?"
+grep -qx 'mocactl user=a url=https://api.sbx.example xdg= sbx credentials add smoke-gh-mcp --preset github-mcp' "$MOCK_LOG" || fail 'no github-mcp add'
+grep -qx 'mocactl user=a url=https://api.sbx.example xdg= sbx credentials delete smoke-gh-mcp' "$MOCK_LOG" || fail 'no github-mcp delete'
+grep -q 'api.githubcopilot.com/mcp/' "$MOCK_LOG" || fail 'no MCP initialize'
+! grep 'api.githubcopilot.com' "$MOCK_LOG" | grep -qi authorization || fail 'the MCP request carried an Authorization header'
+has 'ok 7 - egress credentials: the PAT works from the sandbox without being in it; the placeholder is inert; delete revokes'
+all_cleaned
+nopat
+pass 'step 7 with SBX_SMOKE_GITHUB_MCP=1: initialize without an Authorization header, both credentials deleted'
+
+# Two users: B gets a 401 and a public clone.
+reset_state
+credrun SBX_SMOKE_HOME_B="$TMP/home-b" SBX_SMOKE_CRED_TWO_USERS=1 >"$TMP/out" 2>&1 || fail "step 7 with two users exited $?"
+! grep -q 'SKIP no second user' "$TMP/out" || fail 'the B check was skipped'
+grep -q '^mocactl user=b .* sbx run --sandbox sbx-[0-9a-f]* --timeout 180 -- sh -c curl ' "$MOCK_LOG" || fail "no 401 check in B's sandbox"
+grep -q 'git ls-remote https://github.com/cli/cli HEAD' "$MOCK_LOG" || fail 'no public ls-remote in the B sandbox'
+[[ "$(created)" == 2 ]] || fail "created $(created) sandboxes, not 2"
+all_cleaned
+nopat
+# HOME_B alone, without SBX_SMOKE_CRED_TWO_USERS=1, is not used.
+reset_state
+credrun SBX_SMOKE_HOME_B="$TMP/home-b" >"$TMP/out" 2>&1 || fail "step 7 with an unused B exited $?"
+has "ok 7 - B's sandbox gets a 401 and a public clone works # SKIP no second user"
+! grep -q 'user=b' "$MOCK_LOG" || fail 'B was used without SBX_SMOKE_CRED_TWO_USERS=1'
+pass "step 7's B check runs only with HOME_B and SBX_SMOKE_CRED_TWO_USERS=1"
+
+# Failures: each `not ok 7`, exit 1, and the trap still deletes the credential, the branch and the sandbox.
+credfail() { # credfail WHY ENV...
+  local why="$1" rc=0
+  shift
+  reset_state
+  credrun "$@" >"$TMP/out" 2>&1 || rc=$?
+  [[ "$rc" == 1 ]] || fail "$why: exit $rc, not 1"
+  grep -q "^not ok 7 - .*: .*$why" "$TMP/out" || fail "no 'not ok 7 - ...: ...$why'"
+  all_cleaned
+  [[ ! -e "$MOCK_DIR/cred-smoke-gh" && ! -e "$MOCK_DIR/cred-smoke-gh-mcp" ]] || fail "$why: a credential was left"
+  [[ ! -s "$MOCK_DIR/remote-branches" ]] || fail "$why: the remote branch was left"
+  nopat
+}
+credfail 'is not the PAT.s owner' MOCK_GH_WRONG=1
+grep -q '^# cleanup: deleted credential smoke-gh (user A)$' "$TMP/out" || fail 'the trap did not delete the credential'
+grep -q '^# cleanup: deleted remote branch sbx-smoke-' "$TMP/out" || fail 'the trap did not delete the branch'
+credfail 'got .200., not 401\|got .200. from api.github.com/user' MOCK_PLACEHOLDER_OK=1
+credfail 'after the delete and 65 s the sandbox got' MOCK_CRED_STALE=1
+credfail 'sbx credentials add smoke-gh --preset github' MOCK_FAIL=add
+pass 'a wrong owner, a placeholder that works, a revocation that does not take, a failed add: each `not ok 7`, and the trap deletes the credential, the branch and the sandbox'
