@@ -457,3 +457,104 @@ grep -qx "egress foo $TMP/foo.file" "$EM" && [[ -f "$TMP/foo.file" ]] || fail 'a
 sed -i.bak '/^egress foo /d' "$EM"; rm -f "$EM.bak"
 [[ ! -s "$EM" ]] || fail "manifest not empty at the end: $(cat "$EM")"
 pass 'a two-field manifest uninstalls cleanly; an unknown egress kind is left alone'
+
+# Egress credentials (SBX0.2b, spec §6.2): --egress installs the host CA, the token and a unit drop-in;
+# a worker install checks the snapshot's egress_ca_sha256 once the drop-in exists.
+CD="$SBX_ENV_DIR/egress" DROPIN="$SBX_UNIT_DIR/moca-egress.service.d/sbx-credentials.conf"
+TOKEN="$(printf 'ab%.0s' $(seq 32))"
+ebundle() { # ebundle [API_CA]: an egress bundle as setup.sh writes it
+  local d="$TMP/ebundle"
+  rm -rf "$d"; mkdir -p "$d"
+  printf 'MOCA_EGRESS_CREDENTIALS_URL=https://sbx-api.apps.example.invalid\n' >"$d/egress.env"
+  printf '%s' "$TOKEN" >"$d/egress.token"
+  [[ -z "${1:-}" ]] || printf -- '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n' >"$d/api-ca.crt"
+  echo "$d"
+}
+fp_of() { openssl x509 -in "$1" -outform DER | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1; }
+snap_with() { # snap_with NAME FINGERPRINT-or-empty
+  mkdir -p "$SBX_SRV/snapshots/$1"
+  if [[ -n "$2" ]]; then printf '{\n  "hash": "x",\n  "egress_ca_sha256": "sha256:%s"\n}\n' "$2" >"$SBX_SRV/snapshots/$1/manifest.json"; else rm -f "$SBX_SRV/snapshots/$1/manifest.json"; fi
+}
+[[ ! -s "$EM" ]] || fail 'the credentials block does not start from a clean host'
+bash "$INSTALL" "$(bundle sbx_cr)" --snapshot default >"$TMP/out" 2>&1 || fail 'install the worker before --egress'
+# No drop-in yet: no fingerprint check (chunk 1's behaviour), the snapshot above has no manifest.json.
+
+# A bad bundle is refused before anything is written.
+: >"$MOCK_LOG"
+b="$(ebundle)"; printf 'MOCA_EGRESS_CREDENTIALS_URL=http://x\n' >"$b/egress.env"
+! bash "$INSTALL" --egress "$b" >"$TMP/out" 2>&1 || fail 'accepted an http credentials URL'
+b="$(ebundle)"; printf 'MOCA_EGRESS_CREDENTIALS_URL=https://x.invalid\nOTHER=1\n' >"$b/egress.env"
+! bash "$INSTALL" --egress "$b" >"$TMP/out" 2>&1 || fail 'accepted an extra line in egress.env'
+b="$(ebundle)"; printf 'short' >"$b/egress.token"
+! bash "$INSTALL" --egress "$b" >"$TMP/out" 2>&1 || fail 'accepted a short token'
+! grep -q short "$TMP/out" || fail 'the refusal printed the token'
+[[ ! -e "$CD" && ! -e "$DROPIN" ]] || fail 'wrote credential files before refusing a bad bundle'
+pass '--egress refuses a bad URL, an extra line and a malformed token before writing anything'
+
+: >"$MOCK_LOG"
+bash "$INSTALL" --egress "$(ebundle api)" >"$TMP/out" 2>&1 || fail '--egress'
+[[ "$(mode "$CD/ca.crt")" == 644 && "$(mode "$CD/ca.key")" == 600 && "$(mode "$CD/token")" == 600 ]] ||
+  fail "credential file modes are not 644/600/600 ($(mode "$CD/ca.crt") $(mode "$CD/ca.key") $(mode "$CD/token"))"
+FP1="$(fp_of "$CD/ca.crt")"
+openssl x509 -in "$CD/ca.crt" -noout -text | grep -q 'CA:TRUE' || fail 'the host CA is not a CA'
+for l in "LoadCredential=egress-token:$CD/token" "LoadCredential=egress-ca.crt:$CD/ca.crt" "LoadCredential=egress-ca.key:$CD/ca.key" \
+  "LoadCredential=egress-api-ca.crt:$CD/api-ca.crt" 'Environment=MOCA_EGRESS_CREDENTIALS_URL=https://sbx-api.apps.example.invalid'; do
+  grep -qx "$l" "$DROPIN" || fail "the drop-in lacks $l"
+done
+! grep -rq "$TOKEN" "$SBX_UNIT_DIR" "$TMP/out" || fail 'the token appears in a unit file or the output'
+! grep -q "$TOKEN" "$MOCK_LOG" || fail 'the token appears in a command line'
+! grep -q 'PRIVATE KEY' "$TMP/out" || fail 'the CA key was printed'
+[[ "$(cat "$CD/token")" == "$TOKEN" ]] || fail 'the token file does not hold the token'
+for f in "$DROPIN" "$CD/ca.crt" "$CD/ca.key" "$CD/token" "$CD/api-ca.crt"; do grep -qx "egress credential $f" "$EM" || fail "manifest lacks egress credential $f"; done
+grep -qx 'systemctl daemon-reload' "$MOCK_LOG" && grep -qx 'systemctl restart moca-egress.service' "$MOCK_LOG" || fail '--egress did not daemon-reload and restart moca-egress'
+pass '--egress: CA 0644/0600, token 0600, drop-in with the four LoadCredential lines and the URL, no token leak, recorded'
+
+bash "$INSTALL" --egress "$(ebundle)" >"$TMP/out" 2>&1 || fail '--egress re-run'
+[[ "$(fp_of "$CD/ca.crt")" == "$FP1" ]] || fail 'a re-run regenerated the CA'
+! grep -q 'egress-api-ca.crt' "$DROPIN" && [[ ! -e "$CD/api-ca.crt" ]] || fail 'a re-run without an api CA kept the old one'
+[[ "$(bash "$INSTALL" --egress-ca-out)" == "$CD/ca.crt" ]] || fail '--egress-ca-out does not print the CA path'
+[[ "$(fp_of "$CD/ca.crt")" == "$FP1" ]] || fail '--egress-ca-out regenerated the CA'
+pass 'the CA is generated once: the fingerprint survives a re-run; --egress-ca-out prints its path'
+
+# The fingerprint check: before any systemctl call, naming the rebuild command.
+for case in missing mismatch; do
+  snap_with fpbad "$([[ $case == mismatch ]] && printf '%064d' 1)"
+  : >"$MOCK_LOG"
+  ! bash "$INSTALL" "$(bundle sbx_cr)" --snapshot fpbad >"$TMP/out" 2>&1 || fail "installed a worker on a $case fingerprint"
+  grep -q "deploy/microvm/build-snapshot.sh --egress-ca $CD/ca.crt --out $SBX_SRV/snapshots/<new image>" "$TMP/out" || fail "the $case refusal does not name the rebuild command"
+  ! grep -q systemctl "$MOCK_LOG" || fail "touched systemd before refusing a $case fingerprint"
+done
+snap_with fpok "$FP1"
+bash "$INSTALL" "$(bundle sbx_cr)" --snapshot fpok >"$TMP/out" 2>&1 || fail 'refused a matching fingerprint'
+pass 'a worker install refuses a missing or mismatched egress_ca_sha256 before systemctl, and accepts a match'
+
+# Uninstall: the drop-in, token and api CA go; the CA stays.
+bash "$INSTALL" --egress "$(ebundle api)" >"$TMP/out" 2>&1 || fail '--egress for the uninstall case'
+: >"$MOCK_LOG"
+bash "$INSTALL" --uninstall-egress >"$TMP/out" 2>&1 || fail '--uninstall-egress'
+[[ ! -e "$DROPIN" && ! -e "$CD/token" && ! -e "$CD/api-ca.crt" ]] || fail '--uninstall-egress left the drop-in, token or api CA'
+[[ -f "$CD/ca.crt" && -f "$CD/ca.key" && "$(fp_of "$CD/ca.crt")" == "$FP1" ]] || fail '--uninstall-egress removed the CA'
+grep -q 'kept for the snapshot' "$TMP/out" || fail 'did not log that the CA is kept for the snapshot'
+grep -qx 'systemctl restart moca-egress.service' "$MOCK_LOG" || fail '--uninstall-egress did not restart moca-egress'
+grep -q '^egress credential' "$EM" && ! grep -q "egress credential $DROPIN" "$EM" || fail "manifest after --uninstall-egress: $(cat "$EM")"
+bash "$INSTALL" "$(bundle sbx_cr)" --snapshot default >"$TMP/out" 2>&1 || fail 'no check once the drop-in is gone'
+pass '--uninstall-egress removes the drop-in, token and api CA, keeps the CA, restarts moca-egress'
+
+# The last worker's uninstall removes the credential files the same way.
+bash "$INSTALL" --egress "$(ebundle api)" >"$TMP/out" 2>&1 || fail '--egress before the last uninstall'
+bash "$INSTALL" --uninstall sbx_cr >"$TMP/out" 2>&1 || fail 'last uninstall with credentials'
+[[ ! -e "$DROPIN" && ! -e "$CD/token" && ! -e "$CD/api-ca.crt" && ! -e "$U" ]] || fail 'the last uninstall left credential files or the unit'
+[[ -f "$CD/ca.crt" ]] || fail 'the last uninstall removed the CA'
+pass 'the last-worker uninstall removes the credential files and keeps the CA'
+
+# A foreign moca-egress.service is never configured from here.
+echo '# P6-owned' >"$U"; : >"$MOCK_LOG"
+! bash "$INSTALL" --egress "$(ebundle)" >"$TMP/out" 2>&1 || fail '--egress accepted a foreign moca-egress.service'
+grep -q "P6" "$TMP/out" && grep -q 'own installer' "$TMP/out" || fail 'the foreign refusal does not name the P6 unit and its installer'
+[[ ! -e "$DROPIN" && ! -s "$MOCK_LOG" ]] || fail 'wrote or touched systemd before refusing a foreign unit'
+rm -f "$U"
+pass '--egress refuses a moca-egress.service this script did not install'
+
+# Clean up the kept CA: the host is empty again.
+rm -rf "$CD"; sed -i.bak '/^egress credential /d' "$EM"; rm -f "$EM.bak"
+[[ ! -s "$EM" ]] || fail "manifest not empty at the end of the credentials block: $(cat "$EM")"

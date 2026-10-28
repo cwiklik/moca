@@ -356,6 +356,25 @@ never a timeout. No credential is involved.
 - **Uninstalling** the last worker also stops and removes the `moca-egress.service` this script
   installed; an allowlist you edited stays (`kept ... (edited)`).
 
+### Credential injection (`--egress`)
+
+Three steps, in this order (spec §6.2):
+
+1. `sudo deploy/sbx/install-host.sh --egress /path/to/egress` with the bundle `setup.sh` wrote
+   (`egress.env`, `egress.token`, optional `api-ca.crt`). It generates the host's interception CA once
+   (`/etc/sbx/egress/ca.crt`, `ca.key`), writes the token (0600) and the drop-in
+   `moca-egress.service.d/sbx-credentials.conf`, then restarts `moca-egress`. It refuses a host whose
+   `moca-egress.service` it did not install: the P6-owned unit is configured by its own installer.
+   `--egress-ca-out` prints the CA path (generating it if absent) and does nothing else.
+2. Rebuild the golden snapshot with the CA:
+   `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<new image>`.
+3. Install or re-install the worker with `--snapshot <new image>`. Once the drop-in exists, a snapshot
+   whose `manifest.json` `egress_ca_sha256` is missing or differs is refused before systemd is touched.
+
+A re-run keeps the CA. To rotate it, delete `/etc/sbx/egress/ca.crt` and `ca.key`, re-run `--egress`,
+then rebuild every snapshot (step 2). `--uninstall-egress` removes the drop-in, token and api CA and
+keeps the CA, because existing snapshots were built with it.
+
 ## 10. A KVM-host outage
 
 **What users see.** Every sandbox whose template runs on the host fails: `mocactl sbx run` and the
