@@ -14,7 +14,10 @@ export MOCK_LOG="$TMP/mock.log" MOCK_STATE="$TMP/state" SH_WAIT_SECONDS=2
 unset SH_SANDBOX_DEFAULT_TIER SH_SANDBOX_EGRESS_EXCEPT
 REAL_PATH="$PATH"
 export REAL_PATH
-REAL_BASH="$(command -v bash)"
+# The bash that launched this suite, not the first one on PATH (#440): `/bin/bash setup.test.sh`
+# on macOS must exercise bash 3.2, and `command -v bash` would hand it Homebrew's 5.x instead.
+# $BASH is the running interpreter's own path; the fallback is for a sourced run, where it is unset.
+REAL_BASH="${BASH:-$(command -v bash)}"
 mkdir -p "$TMP/bin" "$MOCK_STATE"
 
 fail() {
@@ -1725,5 +1728,30 @@ reset_state
 (export SH_GITHUB_CLIENT_ID=Iv1.a SH_WORKLOAD_SANDBOXES=1; expect_ok --target kind --skip-build)
 ! grep -q 'overlays/ocp/workload-sandboxes' "$MOCK_STATE/applied-kustomization.yaml" || fail 'kind got the ocp DNS rule'
 pass 'SH_WORKLOAD_SANDBOXES: a bad value and ocp-single are refused before any apply; ocp grants the provisioner and workload sandboxes their SCC and adds their openshift-dns rule'
+
+echo "== #440: the bash 3.2 wiring that runs this suite on macOS still exists"
+# Without this, the arrangement is a claim with nothing behind it: a workflow or Makefile edit
+# could remove the macOS job and the only symptom would be that 3.2 regressions stop being caught
+# -- silently, since every remaining job is bash 5 and would stay green. Same reasoning, and the
+# same substring-level matching, as TestTheCIWorkflowsRunTheGates in
+# remote-worker/internal/vmpool/gates_inventory_test.go: assert that the pieces are wired, not
+# their YAML, because a brittle assertion here gets edited away rather than satisfied.
+REPO_ROOT="$(cd "$SRC_K8S/../.." && pwd)"
+if [[ -f "$REPO_ROOT/.github/workflows/ci.yml" && -f "$REPO_ROOT/Makefile" ]]; then
+  grep -q '^test-deploy-bash32:' "$REPO_ROOT/Makefile" ||
+    fail 'the Makefile has no test-deploy-bash32 target -- nothing runs these suites on bash 3.2 (#440)'
+  # The full path, not the basename: deploy/sbx/tests/setup.test.sh is a different suite.
+  grep -qF 'deploy/k8s/tests/setup.test.sh' "$REPO_ROOT/Makefile" ||
+    fail 'test-deploy-bash32 no longer lists this suite, so macOS CI stopped covering setup.sh (#440)'
+  grep -q '^  deploy-scripts-bash32:' "$REPO_ROOT/.github/workflows/ci.yml" ||
+    fail 'ci.yml has no deploy-scripts-bash32 job -- bash 3.2 is no longer tested on any PR (#440)'
+  grep -q 'runs-on: macos-latest' "$REPO_ROOT/.github/workflows/ci.yml" ||
+    fail 'ci.yml has no macOS runner, so /bin/bash 3.2 is unreachable in CI (#440)'
+  grep -qF 'make test-deploy-bash32' "$REPO_ROOT/.github/workflows/ci.yml" ||
+    fail 'the macOS job no longer runs make test-deploy-bash32 (#440)'
+  pass 'the macOS bash 3.2 job and its Makefile target are still wired to this suite'
+else
+  echo "skip - not run from a repository checkout, so the CI wiring cannot be checked"
+fi
 
 echo "setup.test.sh: all passed"

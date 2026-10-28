@@ -8,6 +8,10 @@ set -euo pipefail
 unset SH_SANDBOX_COUNT SH_SANDBOX_DEFAULT_TIER
 
 SMOKE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/smoke.sh"
+# The bash that launched this suite, not the first one on PATH (#440), as in setup.test.sh:
+# `/bin/bash smoke.test.sh` on macOS must exercise bash 3.2, which is what operators run
+# smoke.sh with. $BASH is the running interpreter; the fallback is for a sourced run.
+REAL_BASH="${BASH:-$(command -v bash)}"
 TMP="$(mktemp -d)"
 # Every log dir a run kept, removed at exit (runs happen in subshells, so a variable would not do).
 cleanup() {
@@ -138,6 +142,15 @@ case " $* " in
 esac
 MOCK
 chmod +x "$TMP/bin/sleep" "$TMP/bin/curl" "$TMP/bin/kubectl"
+# The bash mocks are heredocs with `#!/usr/bin/env bash`, which resolves against the run's PATH --
+# $TMP/bin first, then the caller's, so it would find Homebrew's 5.x even when this suite was
+# launched with /bin/bash. Pin them to $REAL_BASH so the mocks run on the same interpreter as the
+# script under test (#440). The `#!/bin/sh` shims need no pin: they exec an absolute real binary.
+for m in curl kubectl; do
+  { printf '#!%s\n' "$REAL_BASH"; tail -n +2 "$TMP/bin/$m"; } >"$TMP/bin/$m.new"
+  mv "$TMP/bin/$m.new" "$TMP/bin/$m"
+  chmod +x "$TMP/bin/$m"
+done
 
 # run_smoke: the caller's exported MOCK_* shape the run; sets RC and KEPT_DIR.
 run_smoke() {
@@ -145,7 +158,7 @@ run_smoke() {
   mkdir -p "$MOCK_STATE"
   local args=("$@")
   [[ $# -gt 0 ]] || args=(--target kind-ci)
-  if PATH="$TMP/bin:$PATH" K8S_LIVE_SMOKE=1 bash "$SMOKE" "${args[@]}" >"$TMP/out" 2>&1; then RC=0; else RC=$?; fi
+  if PATH="$TMP/bin:$PATH" K8S_LIVE_SMOKE=1 "$REAL_BASH" "$SMOKE" "${args[@]}" >"$TMP/out" 2>&1; then RC=0; else RC=$?; fi
   KEPT_DIR="$(sed -n 's/^logs kept in //p' "$TMP/out" | tail -1)"
   [[ -z "$KEPT_DIR" ]] || printf '%s\n' "$KEPT_DIR" >>"$TMP/kept"
 }
@@ -177,10 +190,10 @@ pass 'a kubectl error in claims 10 and 11 becomes FAIL lines and the summary, lo
   expect_kept 'post-drain forward')
 pass 'a post-drain port-forward that never comes back is a FAIL, and the run reaches the summary'
 
-if out="$(bash "$SMOKE" 2>&1)" && [[ "$out" == SKIP:* ]]; then pass 'without K8S_LIVE_SMOKE=1 it SKIPs'; else fail "no SKIP without K8S_LIVE_SMOKE: $out"; fi
+if out="$("$REAL_BASH" "$SMOKE" 2>&1)" && [[ "$out" == SKIP:* ]]; then pass 'without K8S_LIVE_SMOKE=1 it SKIPs'; else fail "no SKIP without K8S_LIVE_SMOKE: $out"; fi
 
 rc=0
-out="$(K8S_LIVE_SMOKE=1 PATH="$TMP/bin:$PATH" bash "$SMOKE" --target 2>&1)" || rc=$?
+out="$(K8S_LIVE_SMOKE=1 PATH="$TMP/bin:$PATH" "$REAL_BASH" "$SMOKE" --target 2>&1)" || rc=$?
 [[ "$rc" == 2 && "$out" == *'--target needs a value'* ]] || fail "--target with no value: rc=$rc out=$out"
 pass '--target with no value exits 2 and says why'
 
@@ -188,14 +201,14 @@ echo "== --tier p4 (#424)"
 for bad in "--tier p4 --target kind-ci" "--tier bogus --target ocp" "--target ocp --tier"; do
   rc=0
   # shellcheck disable=SC2086 # word-split on purpose: each case is an argv
-  out="$(K8S_LIVE_SMOKE=1 PATH="$TMP/bin:$PATH" bash "$SMOKE" $bad 2>&1)" || rc=$?
+  out="$(K8S_LIVE_SMOKE=1 PATH="$TMP/bin:$PATH" "$REAL_BASH" "$SMOKE" $bad 2>&1)" || rc=$?
   [[ "$rc" == 2 ]] || fail "'$bad' exited $rc, want 2: $out"
 done
 rc=0
-out="$(K8S_LIVE_SMOKE=1 PATH="$TMP/bin:$PATH" bash "$SMOKE" --tier p4 --target kind-ci 2>&1)" || rc=$?
+out="$(K8S_LIVE_SMOKE=1 PATH="$TMP/bin:$PATH" "$REAL_BASH" "$SMOKE" --tier p4 --target kind-ci 2>&1)" || rc=$?
 [[ "$out" == *'--tier p4 needs --target ocp'* ]] || fail "--tier p4 on kind-ci does not say why: $out"
 rc=0
-out="$(K8S_LIVE_SMOKE=1 SMOKE_P4_ADD_ID=bad-id PATH="$TMP/bin:$PATH" bash "$SMOKE" --target ocp --tier p4 2>&1)" || rc=$?
+out="$(K8S_LIVE_SMOKE=1 SMOKE_P4_ADD_ID=bad-id PATH="$TMP/bin:$PATH" "$REAL_BASH" "$SMOKE" --target ocp --tier p4 2>&1)" || rc=$?
 [[ "$rc" == 2 && "$out" == *'SMOKE_P4_ADD_ID'* ]] || fail "a dashed SMOKE_P4_ADD_ID was not refused: rc=$rc $out"
 pass '--tier: p4 needs ocp, an unknown tier and a missing value exit 2, a bad SMOKE_P4_ADD_ID exits 2'
 
