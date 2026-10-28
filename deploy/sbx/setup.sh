@@ -182,7 +182,8 @@ validate_egress() {
   fi
   local spec="${SBX_EGRESS_HOSTS:-}" entry id ws w owned=' ' seen=' '
   if [[ -z "$spec" ]]; then
-    spec="kvm=$(printf '%s,' $SBX_WORKERS)"
+    # Only template workers: the control plane refuses an egress worker that serves no template.
+    spec="kvm=$(printf '%s,' $TEMPLATE_WORKERS)"
     spec="${spec%,}"
   fi
   [[ "$spec" != *[[:space:]]* ]] || die 'SBX_EGRESS_HOSTS must not contain whitespace (kvm-a=w1,w2;kvm-b=w3)'
@@ -201,13 +202,14 @@ validate_egress() {
     for w in "${wl[@]}"; do
       [[ -n "$w" ]] || die "SBX_EGRESS_HOSTS entry '$entry' has an empty worker"
       [[ " $SBX_WORKERS " == *" $w "* ]] || die "worker '$w' is not in SBX_WORKERS (SBX_EGRESS_HOSTS entry '$id')"
+      [[ " $TEMPLATE_WORKERS " == *" $w "* ]] || die "worker '$w' serves no template in SBX_TEMPLATES_FILE (SBX_EGRESS_HOSTS entry '$id'): the control plane refuses an egress worker that is not a template worker"
       [[ "$owned" != *" $w "* ]] || die "worker '$w' is listed twice in SBX_EGRESS_HOSTS (one host owns each worker)"
       owned+="$w "
     done
     EGRESS_IDS+="${EGRESS_IDS:+ }$id"
     EGRESS_SPEC+="${EGRESS_SPEC:+ }$id=$ws"
   done
-  for w in $SBX_WORKERS; do
+  for w in $TEMPLATE_WORKERS; do
     [[ "$owned" == *" $w "* ]] || die "worker '$w' is not owned by any host in SBX_EGRESS_HOSTS"
   done
   # shellcheck disable=SC2086 # one argument per host; entries hold no whitespace
@@ -248,6 +250,7 @@ check_host_idle() {
 # The rules of the control plane's parseTemplates (packages/control-plane/src/sandbox-config.ts),
 # checked here so a bad file is refused before anything is applied rather than as a pod that never
 # boots; plus SBX0 §8.1's: every template's worker is in SBX_WORKERS, one template per worker.
+TEMPLATE_WORKERS=''
 validate_templates() {
   [[ -f "${SBX_TEMPLATES_FILE:-/nonexistent}" ]] ||
     die 'SBX_TEMPLATES_FILE is required: a JSON list of {id, worker, description, tools}'
@@ -265,6 +268,8 @@ validate_templates() {
     [[ "$seen" != *" $tw "* ]] || die "template worker '$tw' serves two templates (one worker per template)"
     seen+="$tw "
   done
+  TEMPLATE_WORKERS="${seen# }"
+  TEMPLATE_WORKERS="${TEMPLATE_WORKERS% }"
   TEMPLATES_JSON="$(jq -c . "$SBX_TEMPLATES_FILE")"
 }
 

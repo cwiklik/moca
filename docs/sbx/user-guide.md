@@ -423,7 +423,8 @@ mocactl sbx credentials add github --preset github < token.txt
 The `github` preset covers `github.com` (git over HTTPS) and `api.github.com` (`gh`). In the
 sandbox, `git clone`, `git push` and `gh pr create` then work against those repositories. The
 `github-mcp` preset does the same for GitHub's remote MCP server (`api.githubcopilot.com`); the
-same PAT works, and `.mcp.json` needs no token.
+same PAT works, and `.mcp.json` needs no token. `api.githubcopilot.com` is not on the default
+egress allowlist: the operator must add it, or the preset gets `403 destination_denied`.
 
 ### List and delete
 

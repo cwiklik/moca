@@ -433,8 +433,10 @@ the host and is a trust anchor, not a secret (P4 §5.2, Z5 E3).
   plus `egress.token` and an optional `api-ca.crt`) is installed with `--egress BUNDLE_DIR`, mirroring
   `--janitor`, under its own manifest kind.
 - `--egress-ca-out PATH` prints where the CA certificate is, for `build-snapshot.sh --egress-ca`.
-  Run order on a new host: `install-host.sh --egress …` → `build-snapshot.sh --egress-ca …` →
-  `install-host.sh BUNDLE --snapshot …`. `RUNBOOK.md` and the `sbx:install`/`sbx:upgrade` procedures
+  Run order on a fresh host: `install-host.sh --egress-ca-out` → `build-snapshot.sh --egress-ca …` →
+  `install-host.sh BUNDLE --snapshot …` → `install-host.sh --egress …` (`--egress` needs an installed
+  worker's `moca-egress`). On a host with a worker: `--egress` → `build-snapshot.sh --egress-ca …` →
+  re-install each worker. `RUNBOOK.md` and the `sbx:install`/`sbx:upgrade` procedures
   carry it.
 
 ### 6.3 Internal services and MCP servers

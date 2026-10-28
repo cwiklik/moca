@@ -545,7 +545,11 @@ bash "$INSTALL" --egress "$(ebundle api)" >"$TMP/out" 2>&1 || fail '--egress bef
 bash "$INSTALL" --uninstall sbx_cr >"$TMP/out" 2>&1 || fail 'last uninstall with credentials'
 [[ ! -e "$DROPIN" && ! -e "$CD/token" && ! -e "$CD/api-ca.crt" && ! -e "$U" ]] || fail 'the last uninstall left credential files or the unit'
 [[ -f "$CD/ca.crt" ]] || fail 'the last uninstall removed the CA'
-pass 'the last-worker uninstall removes the credential files and keeps the CA'
+grep -qF 'credential injection removed with the last worker; re-run install-host.sh --egress after installing a worker' "$TMP/out" ||
+  fail 'the last uninstall did not say it removed credential injection'
+SBX_ENV_DIR='/tmp/a b' bash "$INSTALL" --egress-ca-out >"$TMP/out" 2>&1 && fail '--egress-ca-out accepted a non-plain SBX_ENV_DIR'
+grep -q 'must be a plain absolute path' "$TMP/out" || fail '--egress-ca-out did not name the path rule'
+pass 'the last-worker uninstall removes the credential files, keeps the CA and says to re-run --egress; --egress-ca-out checks SBX_ENV_DIR'
 
 # A foreign moca-egress.service is never configured from here.
 echo '# P6-owned' >"$U"; : >"$MOCK_LOG"

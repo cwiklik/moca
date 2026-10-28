@@ -521,6 +521,8 @@ remove_egress() {
       ;;
     credential)
       remove_credential_file "$path" || continue
+      [[ "$path" != *sbx-credentials.conf ]] ||
+        log 'credential injection removed with the last worker; re-run install-host.sh --egress after installing a worker'
       ;;
     *) continue ;;
     esac
@@ -638,7 +640,12 @@ main() {
   if [[ -n "$UNINSTALL" ]]; then uninstall_worker "$UNINSTALL"; return; fi
   if [[ -n "$UNINSTALL_JANITOR" ]]; then uninstall_janitor; return; fi
   if [[ -n "$JANITOR" ]]; then install_janitor; return; fi
-  if [[ -n "$EGRESS_CA_OUT" ]]; then ensure_host_ca; printf '%s\n' "$(EGRESS_CRED_DIR)/ca.crt"; return; fi
+  if [[ -n "$EGRESS_CA_OUT" ]]; then
+    [[ "$SBX_ENV_DIR" =~ $PLAIN_PATH_RE ]] || die "SBX_ENV_DIR='$SBX_ENV_DIR' must be a plain absolute path"
+    ensure_host_ca
+    printf '%s\n' "$(EGRESS_CRED_DIR)/ca.crt"
+    return
+  fi
   if [[ -n "$UNINSTALL_EGRESS" ]]; then uninstall_egress_credentials; return; fi
   [[ "$SBX_ATTACH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
     die "SBX_ATTACH_TIMEOUT='$SBX_ATTACH_TIMEOUT' must be a whole number of seconds, at least 1"

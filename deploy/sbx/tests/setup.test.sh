@@ -791,4 +791,14 @@ for r in "${egress_refusals[@]}"; do
   grep -Eq -- "$want" "$TMP/out" || fail "refused '$bad', but not with /$want/"
   ! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail "changed something before refusing: $bad"
 done
+# A worker in SBX_WORKERS with no template is not an egress worker (the control plane refuses it at boot):
+# the default kvm host leaves it out, and naming it in SBX_EGRESS_HOSTS is refused before anything is applied.
+reset_state
+run_setup eval "export SBX_EGRESS_CREDENTIALS=1 SBX_WORKERS='sbx_default sbx_py312 sbx_nt'" || fail "non-template worker broke the default host: $(cat "$TMP/out")"
+cm sbx-settings SH_EGRESS_HOSTS | jq -e '. == [{"id":"kvm","workers":["sbx_default","sbx_py312"]}]' >/dev/null || fail 'the default egress host owns a non-template worker'
+reset_state
+! run_setup eval "export SBX_EGRESS_CREDENTIALS=1 SBX_WORKERS='sbx_default sbx_py312 sbx_nt' SBX_EGRESS_HOSTS='a=sbx_default,sbx_py312,sbx_nt'" || fail 'accepted a non-template worker in SBX_EGRESS_HOSTS'
+grep -q "worker 'sbx_nt' serves no template" "$TMP/out" || fail "non-template egress worker not named: $(cat "$TMP/out")"
+! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail 'changed something before refusing a non-template egress worker'
+pass 'egress hosts take only template workers: the default host skips others, an explicit one is refused'
 pass 'refuses a bad switch, a worker listed twice or owned by no host, bad ids, bad separators and an out-of-range TTL'

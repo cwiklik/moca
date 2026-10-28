@@ -358,18 +358,43 @@ never a timeout. No credential is involved.
 
 ### Credential injection (`--egress`)
 
-Three steps, in this order (spec §6.2):
+Prerequisite for both procedures: set `SBX_EGRESS_CREDENTIALS=1` (and optionally `SBX_EGRESS_HOSTS`)
+in `setup.sh`'s env file and run `setup.sh`. That writes `deploy/sbx/.generated/egress/<host id>/`
+(`egress.env`, `egress.token`, optional `api-ca.crt`); pass that `<host id>` directory to `--egress`,
+not its `egress/` parent. `--egress` generates the host's interception CA once (`/etc/sbx/egress/ca.crt`,
+`ca.key`), writes the token (0600) and the drop-in `moca-egress.service.d/sbx-credentials.conf`, then
+restarts `moca-egress`. It refuses a host whose `moca-egress.service` it did not install (the P6-owned
+unit is configured by its own installer) and a host with no worker yet (the unit comes with the first
+worker). `--egress-ca-out` prints the CA path (generating it if absent) and does nothing else. Once the
+drop-in exists, a snapshot whose `manifest.json` `egress_ca_sha256` is missing or differs is refused
+before systemd is touched.
 
-1. `sudo deploy/sbx/install-host.sh --egress /path/to/egress` with the bundle `setup.sh` wrote
-   (`egress.env`, `egress.token`, optional `api-ca.crt`). It generates the host's interception CA once
-   (`/etc/sbx/egress/ca.crt`, `ca.key`), writes the token (0600) and the drop-in
-   `moca-egress.service.d/sbx-credentials.conf`, then restarts `moca-egress`. It refuses a host whose
-   `moca-egress.service` it did not install: the P6-owned unit is configured by its own installer.
-   `--egress-ca-out` prints the CA path (generating it if absent) and does nothing else.
-2. Rebuild the golden snapshot with the CA:
-   `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<new image>`.
-3. Install or re-install the worker with `--snapshot <new image>`. Once the drop-in exists, a snapshot
-   whose `manifest.json` `egress_ca_sha256` is missing or differs is refused before systemd is touched.
+**Fresh host** (no worker installed):
+
+1. `sudo deploy/sbx/install-host.sh --egress-ca-out` (generates the CA).
+2. `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<image>`.
+3. `sudo deploy/sbx/install-host.sh WORKER_BUNDLE --snapshot <image>`.
+4. `sudo deploy/sbx/install-host.sh --egress .generated/egress/<host id>`.
+
+**Existing host** (worker already installed):
+
+1. `sudo deploy/sbx/install-host.sh --egress .generated/egress/<host id>`.
+2. `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<new image>`.
+3. Re-install each worker with `--snapshot <new image>`.
+
+Between `--egress` and the reinstall, users with a stored credential see guest TLS failures on
+intercepted hosts, because the old snapshot does not trust the new CA. Do the reinstall promptly. The
+same applies to a CA rotation.
+
+The default allowlist (`MOCA_EGRESS_ALLOW`) does not include `api.githubcopilot.com`. Add it to
+`/etc/sbx/moca-egress.env` for the `github-mcp` preset, which otherwise gets `403 destination_denied`.
+
+**Turning credential injection off.** Run `install-host.sh --uninstall-egress` on every KVM host
+first, then run `setup.sh` with `SBX_EGRESS_CREDENTIALS=0`. With the cluster off, the lookup route is
+unmounted (404); a host that still has the drop-in treats the 404 as an error and answers
+`503 credential_unavailable` on every allowlisted request, including a plain `git clone` by users with
+no credential. The PVC and the `sbx-egress` Secret stay, so a later on-run finds the stored credentials
+again. The reverse rule: never run `--egress` against a cluster that is still off.
 
 A re-run keeps the CA. To rotate it, delete `/etc/sbx/egress/ca.crt` and `ca.key`, re-run `--egress`,
 then rebuild every snapshot (step 2). `--uninstall-egress` removes the drop-in, token and api CA and
