@@ -133,8 +133,11 @@ describe('agent configuration (SBX0 §6.3)', () => {
     }
   });
 
-  it("writes the MCP server's own instructions as the block, so both say the same (#568)", () => {
-    expect(RULES).toBe(`## Working in the MOCA sandbox\n\n${MCP_INSTRUCTIONS}`);
+  it("writes the MCP server's own instructions, then the GH_TOKEN steering line, as the block (#568)", () => {
+    expect(RULES).toBe(
+      `## Working in the MOCA sandbox\n\n${MCP_INSTRUCTIONS}\n\n` +
+        "GH_TOKEN in the sandbox is a placeholder that the host replaces with the user's token; never set, print or ask for a token.",
+    );
   });
 
   it('names only tools current Claude Code knows: an unknown deny name warns at every start (#568)', () => {

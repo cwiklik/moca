@@ -87,12 +87,18 @@ export interface CreatedSession extends SessionToken {
 
 export type CredentialConsumer = 'inference' | 'sandbox-egress' | 'control-plane';
 
+/** Where a credential goes on the wire; `sandbox-egress` may hold a list of 1-4. */
+export interface CredentialBinding {
+  header: string;
+  format: string;
+}
+
 export interface CredentialDescriptor {
   name: string;
   kind: string;
   consumer: CredentialConsumer;
   destination: { hosts: string[] };
-  binding: { header: string; format: string };
+  binding: CredentialBinding | CredentialBinding[];
   endpoint?: string | null;
 }
 
@@ -100,7 +106,7 @@ export interface PutCredentialRequest {
   kind: string;
   consumer: CredentialConsumer;
   destination: { hosts: string[] };
-  binding?: { header: string; format: string };
+  binding?: CredentialBinding | CredentialBinding[];
   endpoint?: string | null;
   secret: Record<string, string>;
 }
