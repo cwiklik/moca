@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	egressv1 "github.com/rossoctl/moca/gen/go/egress/v1"
+	"github.com/rossoctl/moca/remote-worker/internal/shortdir"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -64,11 +65,7 @@ func (r *recorder) Unregister(vmID string) error {
 
 func shortDir(t *testing.T) string {
 	t.Helper()
-	d, err := os.MkdirTemp("/tmp", "ectl")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	d := shortdir.New(t, "ectl", len("/vm-doomed.sock"))
 	return d
 }
 

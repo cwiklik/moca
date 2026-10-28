@@ -3,10 +3,11 @@ package guestagent
 import (
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/rossoctl/moca/remote-worker/internal/shortdir"
 )
 
 // These cases exercise the address-parsing and unix: paths that are shared, byte for
@@ -31,14 +32,11 @@ func TestListenUnsupportedSchemeIsError(t *testing.T) {
 // without error.
 func TestListenUnixRoundTrip(t *testing.T) {
 	// t.TempDir()'s path is well past the ~104-byte sun_path limit AF_UNIX enforces
-	// on darwin (and on some Linux libc/kernel combos), so this uses a short-named
-	// dir directly under /tmp instead — long enough to be unique, short enough that
-	// the bind itself is what the test exercises, not the platform's path limit.
-	dir, err := os.MkdirTemp("/tmp", "sh-ga-")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	// on darwin (and on some Linux libc/kernel combos), so this asks shortdir for a
+	// dir with room for "/s.sock" under it — TMPDIR when that fits, /tmp otherwise.
+	// Long enough to be unique, short enough that the bind itself is what the test
+	// exercises, not the platform's path limit.
+	dir := shortdir.New(t, "sh-ga-", len("/s.sock"))
 	sockPath := filepath.Join(dir, "s.sock")
 	ln, err := Listen("unix:" + sockPath)
 	if err != nil {

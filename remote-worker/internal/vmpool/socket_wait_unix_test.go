@@ -10,18 +10,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rossoctl/moca/remote-worker/internal/shortdir"
 )
 
-// A short /tmp base, not t.TempDir(): sun_path caps at 104 bytes on darwin (108 on linux),
-// and t.TempDir() on darwin is already ~70 before any suffix -- the same reason
-// launcher_firecracker_collision_unix_test.go's collisionLauncher does this.
+// A base with room for "/fc.sock", not t.TempDir(): sun_path caps at 104 bytes on darwin (108 on
+// linux), and t.TempDir() on darwin is already ~70 before any suffix -- the same reason
+// launcher_firecracker_collision_unix_test.go's collisionLauncher does this. shortdir picks TMPDIR
+// when a directory under it leaves that room, and falls back to /tmp when it does not.
 func sockBase(t *testing.T) string {
 	t.Helper()
-	base, err := os.MkdirTemp("/tmp", "sockwait")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	base := shortdir.New(t, "sockwait", len("/fc.sock"))
 	return base
 }
 

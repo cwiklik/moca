@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rossoctl/moca/remote-worker/internal/shortdir"
 )
 
 // collisionLauncher builds a Firecracker launcher whose JailerBin is a script that
@@ -18,18 +20,16 @@ import (
 // be exec'd, which is the whole point — the guard has to refuse BEFORE it creates,
 // spawns or removes anything.
 //
-// The chroot base is a short /tmp path rather than t.TempDir() on purpose: the jail's
+// The chroot base comes from shortdir rather than t.TempDir() on purpose: the jail's
 // API socket path is a unix socket, and sun_path caps out at 104 bytes on darwin (108
-// on linux). t.TempDir() on darwin is already ~70 bytes before the
+// on linux). t.TempDir() on darwin is already ~70 bytes before the 45-byte
 // /firecracker/<id>/root/run/firecracker.socket suffix is appended, which would make
-// this test fail on path length rather than on the property under test.
+// this test fail on path length rather than on the property under test. That suffix
+// length is passed to shortdir.New, so a TMPDIR too long to hold it costs a fallback to
+// /tmp rather than an EINVAL from bind.
 func collisionLauncher(t *testing.T) (Launcher, string, string) {
 	t.Helper()
-	base, err := os.MkdirTemp("/tmp", "fcguard")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	base := shortdir.New(t, "fcguard", len("/firecracker/vm-6/root/run/firecracker.socket"))
 
 	marker := filepath.Join(base, "jailer-was-spawned")
 	jailer := filepath.Join(base, "jailer")
@@ -165,11 +165,7 @@ func TestFirecrackerProceedsPastTheCollisionGuardWhenTheJailIsFree(t *testing.T)
 // its 5 s timeout. opts.cgroupRoot points the pool at a temp tree because Cgroup2Root names the
 // host's real cgroupfs.
 func TestRestoreCleanupReturnsThePooledCgroupOnAFailedRestore(t *testing.T) {
-	base, err := os.MkdirTemp("/tmp", "fccg")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	base := shortdir.New(t, "fccg", len("/firecracker/vm-42/root/run/firecracker.socket"))
 
 	jailer := filepath.Join(base, "jailer")
 	if err := os.WriteFile(jailer, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {

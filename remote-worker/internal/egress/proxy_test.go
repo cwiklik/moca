@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/rossoctl/moca/remote-worker/internal/egress/control"
+	"github.com/rossoctl/moca/remote-worker/internal/shortdir"
 )
 
 // recSink records events and their JSON form; safe for concurrent use.
@@ -218,11 +219,7 @@ func allow(t *testing.T, s string) []AllowEntry {
 
 func newHarness(t *testing.T, allowList string, mod func(*Config)) *harness {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "eg")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	dir := shortdir.New(t, "eg", len("/vm-quiet.sock"))
 	h := &harness{t: t, sink: &recSink{}, res: newResolver(), dir: dir}
 	cfg := Config{
 		Allow:                 allow(t, allowList),
