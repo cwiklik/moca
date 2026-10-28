@@ -6,6 +6,7 @@
 #   sudo deploy/sbx/install-host.sh --uninstall WORKER_ID
 #   sudo deploy/sbx/install-host.sh --janitor JANITOR_BUNDLE_DIR
 #   sudo deploy/sbx/install-host.sh --uninstall-janitor
+#   sudo deploy/sbx/install-host.sh --egress EGRESS_BUNDLE_DIR | --uninstall-egress | --egress-ca-out
 #
 # BUNDLE_DIR is deploy/sbx/.generated/workers/<id> from deploy/sbx/setup.sh. IMAGE names a golden
 # snapshot under $SBX_SRV/snapshots (deploy/microvm/build-snapshot.sh --out $SBX_SRV/snapshots/IMAGE).
@@ -32,6 +33,17 @@
 # is listed in $SBX_ENV_DIR/manifest, and --uninstall is the undo (spec §8.2): it removes the
 # worker's files and, once no worker is left in the manifest, the shared template unit and
 # sbx.slice and the moca-egress unit it installed (and its env file, unless the operator edited it). It leaves workspace data in place (the janitor, or the operator, removes that).
+#
+# --egress takes deploy/sbx/.generated/egress (egress.env, egress.token [+ api-ca.crt]) and turns on
+# credential injection in the moca-egress this script installed (spec §6.2; refused beside a
+# moca-egress.service it did not install). It generates the host's interception CA ONCE
+# ($SBX_ENV_DIR/egress/ca.crt 0644 and ca.key 0600; a re-run keeps it, to rotate delete both and
+# re-run, then rebuild the snapshot), writes the token (0600) and the drop-in
+# moca-egress.service.d/sbx-credentials.conf (every file via LoadCredential=: $SBX_ENV_DIR is 0700),
+# restarts moca-egress and waits for its socket. Its files are the manifest kind `egress credential
+# <path>`. --egress-ca-out prints the CA path (generating it if absent). --uninstall-egress removes
+# the drop-in, token and api CA and KEEPS the CA (snapshots are built with it). Once the drop-in
+# exists, a worker install refuses a snapshot whose manifest.json egress_ca_sha256 is not the CA's.
 #
 # --janitor takes deploy/sbx/.generated/janitor (janitor.env, janitor.token [+ api-ca.crt]) and
 # installs the host janitor (spec §8.3): $SBX_LIBEXEC_DIR/sbx-janitor.sh, $SBX_ENV_DIR/janitor.env
@@ -64,7 +76,7 @@ die() { echo "deploy/sbx/install-host.sh: $*" >&2; exit 1; }
 
 env_value() { (grep -E "^$1=" "$2" 2>/dev/null || true) | tail -1 | cut -d= -f2-; }
 
-BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' JANITOR='' UNINSTALL_JANITOR='' NO_EGRESS=''
+BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' JANITOR='' UNINSTALL_JANITOR='' NO_EGRESS='' EGRESS_BUNDLE='' UNINSTALL_EGRESS='' EGRESS_CA_OUT=''
 parse_args() {
   while (($#)); do
     case "$1" in
@@ -74,6 +86,9 @@ parse_args() {
     --janitor) [[ $# -ge 2 ]] || die '--janitor needs the janitor bundle directory'; JANITOR="$2"; shift 2 ;;
     --uninstall-janitor) UNINSTALL_JANITOR=1; shift ;;
     --no-egress) NO_EGRESS=1; shift ;;
+    --egress) [[ $# -ge 2 ]] || die '--egress needs the egress bundle directory'; EGRESS_BUNDLE="$2"; shift 2 ;;
+    --uninstall-egress) UNINSTALL_EGRESS=1; shift ;;
+    --egress-ca-out) EGRESS_CA_OUT=1; shift ;;
     -*) die "unknown flag: $1" ;;
     *) [[ -z "$BUNDLE" ]] || die 'one bundle directory at a time'; BUNDLE="$1"; shift ;;
     esac
@@ -199,6 +214,155 @@ install_egress() {
   wait_egress_ready "$env"
 }
 
+# ---- credential injection (spec §6.2) ----
+EGRESS_CRED_DIR() { printf '%s/egress' "$SBX_ENV_DIR"; }
+egress_dropin() { printf '%s/moca-egress.service.d/sbx-credentials.conf' "$SBX_UNIT_DIR"; }
+
+# ca_fingerprint CRT -> the hex sha256 of the certificate's DER form, as build-snapshot.sh records it.
+ca_fingerprint() {
+  local der
+  der="$(mktemp)"
+  openssl x509 -in "$1" -outform DER >"$der" || { rm -f "$der"; die "cannot read the certificate $1"; }
+  sha256_of "$der"
+  rm -f "$der"
+}
+
+# ensure_host_ca: generate the interception CA once; a re-run (or --egress-ca-out) keeps it.
+ensure_host_ca() {
+  local d crt key
+  d="$(EGRESS_CRED_DIR)" crt="$d/ca.crt" key="$d/ca.key"
+  command -v openssl >/dev/null || die 'needs openssl on PATH to generate the host CA'
+  install -d -m 0700 "$SBX_ENV_DIR" "$d"
+  if [[ -s "$crt" && -s "$key" ]]; then
+    chmod 0644 "$crt"; chmod 0600 "$key"
+  else
+    (
+      umask 077
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+        -subj "/CN=moca-egress $(hostname)" -addext basicConstraints=critical,CA:TRUE,pathlen:0 \
+        -addext keyUsage=critical,keyCertSign -keyout "$key" -out "$crt" >/dev/null 2>&1
+    ) || die "could not generate the host CA in $d"
+    chmod 0644 "$crt"; chmod 0600 "$key"
+    log "generated the host interception CA $crt (kept across re-runs; rebuild the snapshot with it)" >&2
+  fi
+  record "egress credential $crt"
+  record "egress credential $key"
+}
+
+# snapshot_ca_fingerprint IMAGE -> the egress_ca_sha256 recorded in the snapshot's manifest.json, or nothing.
+snapshot_ca_fingerprint() {
+  local m="$SBX_SRV/snapshots/$1/manifest.json"
+  [[ -f "$m" ]] || return 0
+  sed -n 's/.*"egress_ca_sha256"[[:space:]]*:[[:space:]]*"sha256:\([0-9a-f]\{64\}\)".*/\1/p' "$m" | head -1
+}
+
+# check_snapshot_ca: with credentials on (the drop-in exists) the snapshot must trust this host's CA.
+check_snapshot_ca() {
+  [[ -f "$(egress_dropin)" ]] || return 0
+  local crt m want got
+  crt="$(EGRESS_CRED_DIR)/ca.crt" m="$SBX_SRV/snapshots/$SNAPSHOT/manifest.json"
+  want="$([[ -f "$crt" ]] && ca_fingerprint "$crt" || true)"
+  got="$(snapshot_ca_fingerprint "$SNAPSHOT")"
+  [[ -n "$want" && "$got" == "$want" ]] ||
+    die "snapshot $SNAPSHOT does not trust this host's egress CA (egress_ca_sha256 in $m is missing or differs): rebuild it with deploy/microvm/build-snapshot.sh --egress-ca $crt --out $SBX_SRV/snapshots/<new image>"
+}
+
+install_egress_credentials() {
+  local b="$EGRESS_BUNDLE" url tok line v d unit dropin
+  d="$(EGRESS_CRED_DIR)" unit="$SBX_UNIT_DIR/moca-egress.service" dropin="$(egress_dropin)"
+  for v in SBX_ENV_DIR SBX_UNIT_DIR; do
+    [[ "${!v}" =~ $PLAIN_PATH_RE ]] || die "$v='${!v}' must be a plain absolute path"
+  done
+  [[ -f "$b/egress.env" && -f "$b/egress.token" ]] ||
+    die "no $b/egress.env and egress.token: pass the bundle directory deploy/sbx/setup.sh wrote (egress/)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == MOCA_EGRESS_CREDENTIALS_URL=* ]] ||
+      die "$b/egress.env has a line other than MOCA_EGRESS_CREDENTIALS_URL= (${line%%=*}): re-run deploy/sbx/setup.sh and copy the new bundle"
+  done <"$b/egress.env"
+  url="$(env_value MOCA_EGRESS_CREDENTIALS_URL "$b/egress.env")"
+  [[ "$url" =~ $JANITOR_URL_RE ]] || die "MOCA_EGRESS_CREDENTIALS_URL in $b/egress.env must be https://<api host>"
+  tok="$(<"$b/egress.token")"
+  [[ "$tok" =~ ^[0-9a-f]{64}$ ]] || die "$b/egress.token is not 64 hex characters: copy the bundle again"
+  if [[ -f "$b/api-ca.crt" ]]; then
+    grep -q -- '-----BEGIN CERTIFICATE-----' "$b/api-ca.crt" || die "$b/api-ca.crt holds no PEM certificate"
+  fi
+  if [[ ! -e "$unit" ]]; then
+    die "no $unit: install a worker first (this script installs moca-egress with it), then re-run --egress"
+  fi
+  egress_claimed unit "$unit" && egress_unit_is_ours "$unit" "$(egress_recorded_hash unit "$unit")" ||
+    die "$unit is the P6-owned moca-egress (this script did not install it): configure its credentials with its own installer; the P6's proxy is not reconfigured from here"
+
+  ensure_host_ca
+  (umask 077 && printf '%s' "$tok" >"$d/token")
+  chmod 0600 "$d/token"
+  record "egress credential $d/token"
+  if [[ -f "$b/api-ca.crt" ]]; then
+    install -m 0644 "$b/api-ca.crt" "$d/api-ca.crt"
+    record "egress credential $d/api-ca.crt"
+  else
+    rm -f "$d/api-ca.crt"
+    egress_forget credential "$d/api-ca.crt"
+  fi
+  install -d -m 0755 "$SBX_UNIT_DIR/moca-egress.service.d"
+  {
+    printf '# Installed by deploy/sbx/install-host.sh --egress. LoadCredential= because %s is 0700.\n[Service]\n' "$SBX_ENV_DIR"
+    printf 'LoadCredential=egress-token:%s/token\n' "$d"
+    printf 'LoadCredential=egress-ca.crt:%s/ca.crt\n' "$d"
+    printf 'LoadCredential=egress-ca.key:%s/ca.key\n' "$d"
+    [[ ! -f "$d/api-ca.crt" ]] || printf 'LoadCredential=egress-api-ca.crt:%s/api-ca.crt\n' "$d"
+    printf 'Environment=MOCA_EGRESS_CREDENTIALS_URL=%s\n' "$url"
+  } >"$dropin"
+  chmod 0644 "$dropin"
+  record "egress credential $dropin"
+  systemctl daemon-reload
+  systemctl reset-failed moca-egress.service || true
+  systemctl restart moca-egress.service || die 'moca-egress failed to start with credentials; the reason is in: journalctl -u moca-egress. Fix it and re-run'
+  wait_egress_ready "$SBX_ENV_DIR/moca-egress.env"
+  warn_untrusting_workers
+  log "moca-egress now injects credentials; build snapshots with: deploy/microvm/build-snapshot.sh --egress-ca $d/ca.crt --out $SBX_SRV/snapshots/<image>"
+}
+
+# warn_untrusting_workers: a warning, not a refusal, because the fresh-host order installs the worker first.
+warn_untrusting_workers() {
+  local want f id img got
+  want="$(ca_fingerprint "$(EGRESS_CRED_DIR)/ca.crt")"
+  for f in "$SBX_ENV_DIR"/workers/*.env; do
+    [[ -f "$f" ]] || continue
+    id="$(basename "$f" .env)"
+    img="$(env_value SH_SNAPSHOT_IMAGE "$f")"
+    [[ -n "$img" ]] || continue
+    got="$(snapshot_ca_fingerprint "$img")"
+    [[ -n "$got" && "$got" == "$want" ]] ||
+      printf "WARNING: worker %s runs snapshot %s, which does not trust this host's CA; guests will see TLS failures on intercepted hosts until it is reinstalled on a snapshot built with --egress-ca\n" "$id" "$img" >&2
+  done
+}
+
+# remove_credential_file PATH: the drop-in, token and api CA go; the host CA stays (snapshots carry it).
+remove_credential_file() {
+  case "$1" in
+  "$(EGRESS_CRED_DIR)/ca.crt" | "$(EGRESS_CRED_DIR)/ca.key") log "kept for the snapshot: $1 (it was built with this CA)"; return 1 ;;
+  esac
+  rm -f "$1"
+  rmdir "$(dirname "$1")" 2>/dev/null || true
+  log "removed $1"
+}
+
+uninstall_egress_credentials() {
+  local unit="$SBX_UNIT_DIR/moca-egress.service" kind path sha
+  if [[ -f "$SBX_ENV_DIR/manifest" ]]; then
+    while read -r kind path sha; do
+      [[ "$kind" == credential && -n "$path" ]] || continue
+      if remove_credential_file "$path"; then egress_forget credential "$path"; fi
+    done < <(sed -n 's/^egress //p' "$SBX_ENV_DIR/manifest")
+  fi
+  systemctl daemon-reload
+  if egress_claimed unit "$unit" && egress_unit_is_ours "$unit" "$(egress_recorded_hash unit "$unit")" &&
+    systemctl is-active --quiet moca-egress.service; then
+    systemctl restart moca-egress.service || die 'moca-egress failed to restart; the reason is in: journalctl -u moca-egress'
+    wait_egress_ready "$SBX_ENV_DIR/moca-egress.env"
+  fi
+}
+
 install_units() {
   install -d -m 0755 "$SBX_UNIT_DIR"
   install -m 0644 "$SCRIPT_DIR/sbx.slice" "$SBX_UNIT_DIR/sbx.slice"
@@ -232,6 +396,7 @@ validate_worker() {
   [[ "$SNAPSHOT" =~ ^[A-Za-z0-9._-]+$ ]] || die '--snapshot must be a directory name'
   [[ -d "$SBX_SRV/snapshots/$SNAPSHOT" ]] || die "no snapshot $SBX_SRV/snapshots/$SNAPSHOT (build it with deploy/microvm/build-snapshot.sh)"
   [[ "$BUDGET_MB" =~ ^[1-9][0-9]*$ ]] && ((BUDGET_MB > 1024)) || die '--budget-mb must be a whole number of MiB above 1024 (the unit reserve)'
+  check_snapshot_ca
   W_ID="$id" W_ADDR="$addr" W_TOK="$tok" W_IDLE="$idle" W_IMAGE_MB="$image_mb"
 }
 
@@ -376,6 +541,11 @@ remove_egress() {
         log "removed $path"
       fi
       ;;
+    credential)
+      remove_credential_file "$path" || continue
+      [[ "$path" != *sbx-credentials.conf ]] ||
+        log 'credential injection removed with the last worker; re-run install-host.sh --egress after installing a worker'
+      ;;
     *) continue ;;
     esac
     egress_forget "$kind" "$path"
@@ -487,11 +657,18 @@ main() {
   parse_args "$@"
   [[ -n "${SBX_SKIP_ROOT_CHECK:-}" || "$(id -u)" == 0 ]] || die 'must run as root'
   local modes=0 m
-  for m in "$BUNDLE" "$UNINSTALL" "$JANITOR" "$UNINSTALL_JANITOR"; do [[ -z "$m" ]] || modes=$((modes + 1)); done
-  ((modes <= 1)) || die 'one of BUNDLE_DIR, --uninstall, --janitor or --uninstall-janitor at a time'
+  for m in "$BUNDLE" "$UNINSTALL" "$JANITOR" "$UNINSTALL_JANITOR" "$EGRESS_BUNDLE" "$UNINSTALL_EGRESS" "$EGRESS_CA_OUT"; do [[ -z "$m" ]] || modes=$((modes + 1)); done
+  ((modes <= 1)) || die 'one of BUNDLE_DIR, --uninstall, --janitor, --uninstall-janitor, --egress, --uninstall-egress or --egress-ca-out at a time'
   if [[ -n "$UNINSTALL" ]]; then uninstall_worker "$UNINSTALL"; return; fi
   if [[ -n "$UNINSTALL_JANITOR" ]]; then uninstall_janitor; return; fi
   if [[ -n "$JANITOR" ]]; then install_janitor; return; fi
+  if [[ -n "$EGRESS_CA_OUT" ]]; then
+    [[ "$SBX_ENV_DIR" =~ $PLAIN_PATH_RE ]] || die "SBX_ENV_DIR='$SBX_ENV_DIR' must be a plain absolute path"
+    ensure_host_ca
+    printf '%s\n' "$(EGRESS_CRED_DIR)/ca.crt"
+    return
+  fi
+  if [[ -n "$UNINSTALL_EGRESS" ]]; then uninstall_egress_credentials; return; fi
   [[ "$SBX_ATTACH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
     die "SBX_ATTACH_TIMEOUT='$SBX_ATTACH_TIMEOUT' must be a whole number of seconds, at least 1"
   # At least 1: the hold must outlast the worker's first reconnect backoff (at most 750ms), or a
@@ -500,7 +677,8 @@ main() {
     die "SBX_ATTACH_SETTLE='$SBX_ATTACH_SETTLE' must be a whole number of seconds, at least 1, to outlast the worker's first reconnect backoff (at most 750ms)"
   [[ "$MOCA_EGRESS_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
     die "MOCA_EGRESS_READY_TIMEOUT='$MOCA_EGRESS_READY_TIMEOUT' must be a whole number of seconds, at least 1"
-  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress] | --uninstall ID | --janitor DIR | --uninstall-janitor'
+  if [[ -n "$EGRESS_BUNDLE" ]]; then install_egress_credentials; return; fi
+  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress] | --uninstall ID | --janitor DIR | --uninstall-janitor | --egress DIR | --uninstall-egress | --egress-ca-out'
   validate_worker
   [[ -n "$NO_EGRESS" ]] || install_egress
   install_units

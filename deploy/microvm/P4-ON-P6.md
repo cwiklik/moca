@@ -596,6 +596,15 @@ proxy's `DynamicUser` needs no group). While `moca-egress` is down, restores fai
   that gap waits in the socket backlog and is served once the VM is re-registered.
 - **Audit:** one JSON line per request (host, method, path without query, status, `bytes_up`,
   `bytes_down`, `dial_addr`, decision) in `journalctl -u moca-egress`.
+- **Interception CA (`--egress-ca`):** `build-snapshot.sh --egress-ca PATH` bakes the KVM host's
+  interception CA into the golden snapshot's trust store (the public certificate only; a file with any
+  `PRIVATE KEY` block, or one `openssl x509` cannot parse, is refused before anything is staged). It
+  uses the rootfs's own `update-ca-certificates` (Debian, Ubuntu, Alpine) or `update-ca-trust` (RHEL
+  family), and dies if the rootfs has neither. Init then exports `NODE_EXTRA_CA_CERTS`,
+  `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE`. `manifest.json` gains `egress_ca_sha256`, the SHA-256 of
+  the CA in DER form (`openssl x509 -outform DER | sha256sum`, prefixed `sha256:`). It sits outside
+  `hash`, so a worker that predates it still verifies. Without the flag the rootfs and the manifest
+  are unchanged.
 - **Not in this slice:** no credentials (the guest's `GH_TOKEN` is the placeholder `moca-placeholder`),
   no TLS interception, no cert-pinning escape hatch, and `MOCA_TENANCY=multi` is refused at boot.
   Because nothing swaps the placeholder yet, tools that send `GH_TOKEN`/`GITHUB_TOKEN` to GitHub (`gh`,

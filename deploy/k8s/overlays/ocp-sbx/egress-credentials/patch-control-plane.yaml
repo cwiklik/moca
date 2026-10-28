@@ -1,0 +1,43 @@
+# The credential store, KEK and egress hosts on the sandbox profile (spec §4.3). Names the BASE
+# namespace like every patch in the overlay. SH_EGRESS_HOSTS and the TTL come from sbx-settings
+# (setup.sh writes them); the KEK and one token per host are files in /run/credentials, from the
+# Secret sbx-egress, which setup.sh keeps apart from moca-mu1.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: moca-control-plane, namespace: moca }
+spec:
+  # An RWO volume cannot attach to the surge pod of a rolling update on a multi-node cluster.
+  strategy: { type: Recreate, rollingUpdate: null }
+  template:
+    spec:
+      containers:
+        - name: control-plane
+          env:
+            - { name: SH_CREDENTIAL_STORE, value: file }
+            - { name: SH_CREDENTIAL_DIR, value: /var/lib/moca/credentials }
+            - name: SH_EGRESS_HOSTS
+              valueFrom:
+                { configMapKeyRef: { name: sbx-settings, key: SH_EGRESS_HOSTS, optional: true } }
+            - name: SH_EGRESS_CREDENTIAL_TTL_SECONDS
+              valueFrom:
+                {
+                  configMapKeyRef:
+                    { name: sbx-settings, key: SH_EGRESS_CREDENTIAL_TTL_SECONDS, optional: true },
+                }
+          volumeMounts:
+            - { name: credential-store, mountPath: /var/lib/moca/credentials }
+      volumes:
+        - name: credential-store
+          persistentVolumeClaim: { claimName: moca-sbx-credentials }
+        # moca-mu1's two items (the overlay's) and every key of sbx-egress, each a file.
+        - name: credentials
+          secret: null
+          projected:
+            defaultMode: 256 # 0400
+            sources:
+              - secret:
+                  name: moca-mu1
+                  items:
+                    - { key: SH_SESSION_TOKEN_PRIVATE_KEY, path: SH_SESSION_TOKEN_PRIVATE_KEY }
+                    - { key: SH_JANITOR_TOKEN, path: SH_JANITOR_TOKEN }
+              - secret: { name: sbx-egress }

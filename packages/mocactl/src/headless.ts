@@ -289,12 +289,12 @@ export interface RunOptions {
   configRef?: string;
 }
 
-/** False (with the reason on stderr) unless there is a control plane and a valid login for it. */
-export function ready(
-  rt: Runtime,
-  io: Io,
-): rt is Runtime & Required<Pick<Runtime, 'cp' | 'harness'>> {
-  if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp || !rt.harness) return false;
+/**
+ * False (with the reason on stderr) unless there is a control plane and a valid login for it. The
+ * harness is not asked about: `mocactl sbx` has a control plane of its own and no harness.
+ */
+export function readyCp(rt: Runtime, io: Io): rt is Runtime & Required<Pick<Runtime, 'cp'>> {
+  if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp) return false;
   if (!apiTokenValid(rt.auth, rt.now())) {
     io.err(
       rt.auth?.refreshToken
@@ -304,6 +304,15 @@ export function ready(
     return false;
   }
   return true;
+}
+
+/** `readyCp`, and a harness too. */
+export function ready(
+  rt: Runtime,
+  io: Io,
+): rt is Runtime & Required<Pick<Runtime, 'cp' | 'harness'>> {
+  if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp || !rt.harness) return false;
+  return readyCp(rt, io);
 }
 
 export async function cmdPromote(
@@ -542,6 +551,20 @@ export interface ManageOptions {
   signal?: AbortSignal;
 }
 
+/** What the credential commands need ready: `mocactl sbx` has a control plane and no harness. */
+export interface CredentialReadiness {
+  readiness?: 'cp' | 'harness';
+  /** The exit code for a failed request, when the caller words failures itself (default: `failed`). */
+  onError?: (err: unknown) => number;
+}
+
+const credentialsReady = (
+  rt: Runtime,
+  io: Io,
+  o: CredentialReadiness,
+): rt is Runtime & Required<Pick<Runtime, 'cp'>> =>
+  o.readiness === 'cp' ? readyCp(rt, io) : ready(rt, io);
+
 export async function cmdSessions(rt: Runtime, io: Io, opts: ManageOptions): Promise<number> {
   if (!ready(rt, io)) return 2;
   let sessions: SessionSummary[];
@@ -604,8 +627,12 @@ export async function cmdSessionDelete(
   return 0;
 }
 
-export async function cmdCredentials(rt: Runtime, io: Io, opts: ManageOptions): Promise<number> {
-  if (!ready(rt, io)) return 2;
+export async function cmdCredentials(
+  rt: Runtime,
+  io: Io,
+  opts: ManageOptions & CredentialReadiness,
+): Promise<number> {
+  if (!credentialsReady(rt, io, opts)) return 2;
   let rows;
   try {
     rows = (await cancellable(rt.cp.listCredentials(), opts.signal)).map((c) => ({
@@ -616,7 +643,7 @@ export async function cmdCredentials(rt: Runtime, io: Io, opts: ManageOptions): 
       endpoint: c.endpoint ?? null,
     }));
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   if (opts.json) {
     io.out(JSON.stringify({ credentials: rows }) + '\n');
@@ -634,7 +661,7 @@ export async function cmdCredentials(rt: Runtime, io: Io, opts: ManageOptions): 
   return 0;
 }
 
-export interface CredentialAddOptions extends ManageOptions {
+export interface CredentialAddOptions extends ManageOptions, CredentialReadiness {
   name: string;
   kind: string;
   consumer: CredentialConsumer;
@@ -650,7 +677,7 @@ export async function cmdCredentialAdd(
   io: Io,
   opts: CredentialAddOptions,
 ): Promise<number> {
-  if (!ready(rt, io)) return 2;
+  if (!credentialsReady(rt, io, opts)) return 2;
   const values = {
     name: opts.name,
     kind: opts.kind,
@@ -680,7 +707,7 @@ export async function cmdCredentialAdd(
   try {
     text = await cancellable(opts.readStdin(), opts.signal);
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   const read = secretFromStdin(opts.kind, text);
   if ('problem' in read) {
@@ -696,7 +723,7 @@ export async function cmdCredentialAdd(
   try {
     await cancellable(rt.cp.putCredential(name, req), opts.signal);
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   io.err(`stored credential ${sanitizeRemote(name)}`);
   if (opts.json) io.out(JSON.stringify({ name, status: 'stored' }) + '\n');
@@ -706,9 +733,9 @@ export async function cmdCredentialAdd(
 export async function cmdCredentialDelete(
   rt: Runtime,
   io: Io,
-  opts: ManageOptions & { name: string },
+  opts: ManageOptions & CredentialReadiness & { name: string },
 ): Promise<number> {
-  if (!ready(rt, io)) return 2;
+  if (!credentialsReady(rt, io, opts)) return 2;
   const name = sanitizeRemote(opts.name);
   try {
     // The server answers 204 for a name that never existed (no existence oracle), but the owner
@@ -720,7 +747,7 @@ export async function cmdCredentialDelete(
     }
     await cancellable(rt.cp.deleteCredential(opts.name), opts.signal);
   } catch (err) {
-    return failed(io, err);
+    return opts.onError ? opts.onError(err) : failed(io, err);
   }
   io.err(`deleted credential ${name}`);
   if (opts.json) io.out(JSON.stringify({ name: opts.name, status: 'deleted' }) + '\n');

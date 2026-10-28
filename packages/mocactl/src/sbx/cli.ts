@@ -24,6 +24,13 @@ import {
 import { cmdDoctor } from './doctor.js';
 import { type ExecFactory } from './exec.js';
 import { cmdCodex, type CodexDeps } from './codex.js';
+import {
+  addCredential,
+  addProblem,
+  deleteCredential,
+  listCredentials,
+  listPresets,
+} from './credentials.js';
 import { cmdMcp, cmdPut, cmdRun, parseTimeout, workspacePath } from './run.js';
 import { PushError, repoRoot } from './push.js';
 import { findSandboxFile, readBinding, readBoundSandbox, SANDBOX_ID_RE } from './state.js';
@@ -81,6 +88,14 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx pull [--apply] [-o FILE]           the sandbox's changes as a patch, on stdout or in
                                                  FILE (--apply: apply it here, then advance the
                                                  sandbox's baseline)
+  mocactl sbx credentials [list] [--json]       the credentials the host swaps into your sandboxes' HTTPS requests
+  mocactl sbx credentials add NAME (--host DEST ... [--kind K] | --preset ID)
+                                                 store one (the secret is read from stdin, never argv);
+                                                 DEST is host[:port][/prefix]; K: bearer (default), basic,
+                                                 api-key, oauth2-token (basic: stdin is username=...
+                                                 and password=... lines)
+  mocactl sbx credentials presets [--json]       the presets \`add --preset\` knows
+  mocactl sbx credentials delete NAME            delete one
   mocactl sbx doctor [--sandbox ID] [--json]     check login, sandbox, agent config, exec and recent
                                                  calls (exit 0 when every check passes, else 1)
 ID (or --sandbox ID) defaults to the sandbox in the nearest .sbx/sandbox.json. The control plane
@@ -317,6 +332,9 @@ export async function sbxMain(
         cortex: { type: 'boolean' },
         'keep-config': { type: 'boolean' },
         'no-browser': { type: 'boolean' },
+        host: { type: 'string', multiple: true },
+        kind: { type: 'string' },
+        preset: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     });
@@ -351,6 +369,7 @@ export async function sbxMain(
     'push',
     'pull',
     'doctor',
+    'credentials',
   ];
   if (!known.includes(command)) {
     io.err(`sbx: unknown command '${command}'\n${SBX_USAGE}`);
@@ -375,6 +394,11 @@ export async function sbxMain(
   );
   if (flagMisuse) {
     io.err(`sbx: --${flagMisuse[0]} only applies to ${flagMisuse[1].join(' and ')}\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  const credFlag = (['host', 'kind', 'preset'] as const).find((f) => values[f] !== undefined);
+  if (credFlag && !(command === 'credentials' && arg === 'add')) {
+    io.err(`sbx: --${credFlag} only applies to credentials add\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
   if (values.cortex && values['no-agent-config']) {
@@ -412,9 +436,16 @@ export async function sbxMain(
     // run quotes its CMD; codex forwards its own flags and prompt to the child.
     command === 'run' ||
     command === 'codex' ||
-    (command === 'put'
-      ? arg !== undefined && extra.length === 0
-      : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
+    (command === 'credentials'
+      ? arg === undefined ||
+        (arg === 'presets'
+          ? extra.length === 0
+          : arg === 'list'
+            ? extra.length === 0
+            : ['add', 'delete'].includes(arg) && extra.length === 1)
+      : command === 'put'
+        ? arg !== undefined && extra.length === 0
+        : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
   if (!argsOk) {
     io.err(
       `sbx: ${command === 'put' ? 'put takes exactly one PATH' : `too many arguments for ${command}`}\n${SBX_USAGE}`,
@@ -473,6 +504,15 @@ export async function sbxMain(
       return SBX_EXIT.usage;
     }
   }
+  const addOpts = (name: string) => ({
+    name,
+    ...(values.preset !== undefined ? { preset: values.preset } : {}),
+    ...(values.kind !== undefined ? { kind: values.kind } : {}),
+    hosts: (values.host ?? [])
+      .flatMap((h) => h.split(','))
+      .map((h) => h.trim())
+      .filter(Boolean),
+  });
   const timeout = parseTimeout(io, values.timeout);
   if (timeout === null) return SBX_EXIT.usage;
   let script: string | undefined;
@@ -525,6 +565,32 @@ export async function sbxMain(
     };
   }
 
+  if (command === 'credentials') {
+    if (arg !== undefined && !['add', 'delete', 'presets', 'list'].includes(arg)) {
+      io.err(`sbx: unknown credentials command '${sanitizeRemote(arg)}'\n${SBX_USAGE}`);
+      return SBX_EXIT.usage;
+    }
+    // The catalog is local: no login, no request, no stdin.
+    if (arg === 'presets') return listPresets({ io, json: values.json === true });
+    if (arg === 'add' || arg === 'delete') {
+      if (!extra[0]) {
+        io.err(`sbx: credentials ${arg} needs a NAME\n${SBX_USAGE}`);
+        return SBX_EXIT.usage;
+      }
+    }
+    if (arg === 'add') {
+      const bad = addProblem({
+        ...addOpts(extra[0]!),
+        readStdin: async () => '',
+        stdinIsTTY: false,
+      });
+      if (bad) {
+        io.err(`sbx: ${bad}`);
+        return SBX_EXIT.usage;
+      }
+    }
+  }
+
   // A sandbox bound by .sbx/sandbox.json lives on the control plane `sbx up` used, which may not be
   // the one remembered at login (a `sbx mcp` started by an agent has no MOCACTL_SBX_URL): the flag
   // and the environment still win (R5j).
@@ -571,6 +637,15 @@ export async function sbxMain(
       if (code !== SBX_EXIT.ok || values['keep-config'] || !bound) return code;
       return unbind(ctx, bindingRoot!);
     }
+    case 'credentials':
+      if (arg === 'add') {
+        return addCredential(ctx, {
+          ...addOpts(extra[0]!),
+          readStdin: deps.readStdin ?? (async () => ''),
+          stdinIsTTY: deps.stdinIsTTY === true || !deps.readStdin,
+        });
+      }
+      return arg === 'delete' ? deleteCredential(ctx, extra[0]!) : listCredentials(ctx);
     case 'doctor':
       return cmdDoctor(ctx, root, id, deps.execFactory, deps.claudeVersion, deps.agentop);
     case 'token':

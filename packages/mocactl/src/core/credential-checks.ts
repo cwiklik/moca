@@ -154,8 +154,10 @@ export function toPutRequest(values: Record<string, string>): {
 export function secretFromStdin(
   kind: string,
   text: string,
+  /** Read the input as this one field, whatever the kind's fields are (a preset fills the rest). */
+  onlyField?: string,
 ): { secret: Record<string, string> } | { problem: string } {
-  const fields = kindFields(kind);
+  const fields = onlyField !== undefined ? [onlyField] : kindFields(kind);
   if (fields?.length === 1) {
     const field = fields[0]!;
     const value = text.replace(/\r?\n$/, '');

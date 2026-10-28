@@ -24,6 +24,16 @@
 #   SBX_RETENTION_DAYS      optional; 1-90, default 14: how long a terminated sandbox stays listed
 #   SBX_MAX_PER_SUBJECT, SBX_MAX_TOTAL   optional; live-sandbox quotas, default 3 and 40
 #   SBX_MAX_INFLIGHT        optional; 1-8, default 2: Execs one sandbox may have in flight
+#   SBX_EGRESS_CREDENTIALS  optional; unset, 0 or 1 (SBX0.2b, spec §4.3). 1 turns on user-scoped egress
+#                           credentials: the control plane's file store (a PVC) and credential routes,
+#                           a KEK and one bearer per KVM host in the Secret sbx-egress, and an egress
+#                           bundle per host. Unset or 0 changes nothing (a re-run is byte-identical);
+#                           turning it off later leaves sbx-egress and the PVC in place
+#   SBX_EGRESS_HOSTS        optional, with SBX_EGRESS_CREDENTIALS=1: kvm-a=sbx_default,sbx_py312;kvm-b=w3
+#                           (host ids ^[a-z0-9][a-z0-9-]{0,30}$; every template worker, one listed in
+#                           SBX_TEMPLATES_FILE, owned by exactly one host). Unset: one host, kvm,
+#                           owning every template worker
+#   SBX_EGRESS_CREDENTIAL_TTL_SECONDS   optional; 5-300 (the control plane's default is 60)
 #   SBX_WORKSPACE_IMAGE_MB  optional; default 2048 (microvm-worker's SH_WORKSPACE_IMAGE_MB)
 #   SBX_{ATTACH,EXEC,API}_TLS_{CERT,KEY}   optional; otherwise self-signed (attach, exec) or the
 #                           router's default certificate (API)
@@ -42,8 +52,9 @@
 # environment or a builtin printf into a pipe, and messages name keys only.
 #
 # Writes deploy/sbx/.generated/: the applied overlay, workers/<id>/ (worker.env [+ relay-ca.crt],
-# for deploy/sbx/install-host.sh on the KVM host) and janitor/ (janitor.env, janitor.token
-# [+ api-ca.crt], for install-host.sh --janitor). Copy each bundle straight to its host and delete
+# for deploy/sbx/install-host.sh on the KVM host), janitor/ (janitor.env, janitor.token
+# [+ api-ca.crt], for install-host.sh --janitor) and, with SBX_EGRESS_CREDENTIALS=1, egress/<host id>/
+# (egress.env, egress.token [+ api-ca.crt], for install-host.sh --egress). Copy each bundle straight to its host and delete
 # the copy. Users log in with `mocactl sbx login`; nothing here is handed to them.
 set -euo pipefail
 
@@ -141,6 +152,7 @@ validate() {
   check_host_idle
 
   validate_templates
+  validate_egress
 
   local pair
   for pair in ATTACH EXEC API; do
@@ -150,6 +162,65 @@ validate() {
   done
   NS="$SBX_NAMESPACE"
 }
+
+# SBX_EGRESS_CREDENTIALS and what it takes (spec §4.3). Sets EGRESS_ON, EGRESS_IDS (host ids, in
+# order), EGRESS_SPEC ("id=w1,w2" per host) and EGRESS_HOSTS_JSON, and checks the hosts against
+# the template workers: each owned by exactly one host, so a bad list is refused before anything is applied.
+EGRESS_ON=''
+EGRESS_IDS=''
+EGRESS_SPEC=''
+EGRESS_HOSTS_JSON=''
+EGRESS_HOST_RE='^[a-z0-9][a-z0-9-]{0,30}$'
+validate_egress() {
+  case "${SBX_EGRESS_CREDENTIALS:-}" in
+    '' | 0) return 0 ;;
+    1) EGRESS_ON=1 ;;
+    *) die 'SBX_EGRESS_CREDENTIALS must be unset, 0 or 1' ;;
+  esac
+  if [[ -n "${SBX_EGRESS_CREDENTIAL_TTL_SECONDS:-}" ]]; then
+    [[ "$SBX_EGRESS_CREDENTIAL_TTL_SECONDS" =~ ^([5-9]|[1-9][0-9]|[12][0-9][0-9]|300)$ ]] ||
+      die 'SBX_EGRESS_CREDENTIAL_TTL_SECONDS must be a whole number of seconds, 5-300'
+  fi
+  local spec="${SBX_EGRESS_HOSTS:-}" entry id ws w owned=' ' seen=' '
+  if [[ -z "$spec" ]]; then
+    # Only template workers: the control plane refuses an egress worker that serves no template.
+    spec="kvm=$(printf '%s,' $TEMPLATE_WORKERS)"
+    spec="${spec%,}"
+  fi
+  [[ "$spec" != *[[:space:]]* ]] || die 'SBX_EGRESS_HOSTS must not contain whitespace (kvm-a=w1,w2;kvm-b=w3)'
+  local -a entries
+  IFS=';' read -r -a entries <<<"$spec"
+  for entry in "${entries[@]}"; do
+    [[ -n "$entry" ]] || die 'SBX_EGRESS_HOSTS has an empty entry (kvm-a=w1,w2;kvm-b=w3)'
+    [[ "$entry" == *=* ]] || die "SBX_EGRESS_HOSTS entry '$entry' is not id=worker,worker"
+    id="${entry%%=*}" ws="${entry#*=}"
+    [[ "$id" =~ $EGRESS_HOST_RE ]] || die "host id '$id' must match $EGRESS_HOST_RE"
+    [[ "$seen" != *" $id "* ]] || die "host id '$id' is listed twice in SBX_EGRESS_HOSTS"
+    seen+="$id "
+    [[ -n "$ws" ]] || die "SBX_EGRESS_HOSTS entry '$entry' lists no worker"
+    local -a wl
+    IFS=',' read -r -a wl <<<"$ws"
+    for w in "${wl[@]}"; do
+      [[ -n "$w" ]] || die "SBX_EGRESS_HOSTS entry '$entry' has an empty worker"
+      [[ " $SBX_WORKERS " == *" $w "* ]] || die "worker '$w' is not in SBX_WORKERS (SBX_EGRESS_HOSTS entry '$id')"
+      [[ " $TEMPLATE_WORKERS " == *" $w "* ]] || die "worker '$w' serves no template in SBX_TEMPLATES_FILE (SBX_EGRESS_HOSTS entry '$id'): the control plane refuses an egress worker that is not a template worker"
+      [[ "$owned" != *" $w "* ]] || die "worker '$w' is listed twice in SBX_EGRESS_HOSTS (one host owns each worker)"
+      owned+="$w "
+    done
+    EGRESS_IDS+="${EGRESS_IDS:+ }$id"
+    EGRESS_SPEC+="${EGRESS_SPEC:+ }$id=$ws"
+  done
+  for w in $TEMPLATE_WORKERS; do
+    [[ "$owned" == *" $w "* ]] || die "worker '$w' is not owned by any host in SBX_EGRESS_HOSTS"
+  done
+  # shellcheck disable=SC2086 # one argument per host; entries hold no whitespace
+  EGRESS_HOSTS_JSON="$(jq -nc '[$ARGS.positional[] | split("=") | {id: .[0], workers: (.[1] | split(","))}]' --args $EGRESS_SPEC)"
+}
+
+# The Secret key that carries a host's bearer: packages/control-plane/src/egress-config.ts
+# egressTokenEnvName (kvm-a -> SH_EGRESS_TOKEN_KVM_A), which the control plane reads from
+# $CREDENTIALS_DIRECTORY/<NAME>. tests/setup.test.sh pins one hyphenated id.
+egress_key() { printf 'SH_EGRESS_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 
 # The control plane rolls with a new lifetime at once, but a running worker keeps the
 # SH_WORKSPACE_IDLE it was installed with until install-host.sh is re-run on its host. Raising the
@@ -180,6 +251,7 @@ check_host_idle() {
 # The rules of the control plane's parseTemplates (packages/control-plane/src/sandbox-config.ts),
 # checked here so a bad file is refused before anything is applied rather than as a pod that never
 # boots; plus SBX0 §8.1's: every template's worker is in SBX_WORKERS, one template per worker.
+TEMPLATE_WORKERS=''
 validate_templates() {
   [[ -f "${SBX_TEMPLATES_FILE:-/nonexistent}" ]] ||
     die 'SBX_TEMPLATES_FILE is required: a JSON list of {id, worker, description, tools}'
@@ -197,6 +269,8 @@ validate_templates() {
     [[ "$seen" != *" $tw "* ]] || die "template worker '$tw' serves two templates (one worker per template)"
     seen+="$tw "
   done
+  TEMPLATE_WORKERS="${seen# }"
+  TEMPLATE_WORKERS="${TEMPLATE_WORKERS% }"
   TEMPLATES_JSON="$(jq -c . "$SBX_TEMPLATES_FILE")"
 }
 
@@ -362,6 +436,61 @@ ensure_signing_key() {
   )
 }
 
+# The egress Secret, sbx-egress (SBX_EGRESS_CREDENTIALS=1 only): SH_CREDENTIAL_KEK (32 random bytes,
+# base64: what keksFromBase64 reads) and one bearer per host (rand_hex, 64 hex). Each generated once
+# and kept. Separate from moca-mu1, so an off run leaves moca-mu1's apply unchanged and the KEK
+# survives turning the feature off. A host no longer listed has its token removed by an explicit null
+# patch (not apply pruning): the control plane then refuses it within one credential TTL. Every key
+# rides in each apply: with one field manager, an apply that omitted one would prune it.
+ensure_egress_secrets() {
+  [[ -n "$EGRESS_ON" ]] || return 0
+  local json kek id key stale patch k want=' '
+  json="$(secret_json sbx-egress)"
+  kek="$(json_value "$json" SH_CREDENTIAL_KEK)"
+  [[ -n "$kek" ]] || { log 'generating the credential KEK (SH_CREDENTIAL_KEK)'; kek="$(openssl rand -base64 32 | tr -d '\n')"; }
+  # keksFromBase64 reads a comma-separated ring, newest first: every entry must be 32 bytes. An
+  # existing ring is never rewritten, and a bad one is not met with advice to delete it.
+  local entry n=0 bad=''
+  local -a ring
+  IFS=',' read -r -a ring <<<"$kek"
+  for entry in "${ring[@]}"; do
+    entry="${entry//[[:space:]]/}"
+    [[ -n "$entry" ]] || continue
+    n=$((n + 1))
+    [[ "$(printf '%s' "$entry" | base64 --decode 2>/dev/null | wc -c | tr -d ' ')" == 32 ]] || bad=1
+  done
+  if [[ -n "$bad" || "$n" == 0 ]]; then
+    if [[ "$kek" == *,* ]]; then
+      die 'sbx-egress SH_CREDENTIAL_KEK is a ring with an entry that is not 32 bytes of base64: fix that entry in the Secret by hand (every entry, newest first, must decode to 32 bytes)'
+    fi
+    die 'sbx-egress SH_CREDENTIAL_KEK is not 32 bytes of base64: delete the key and re-run (this makes stored credentials unreadable)'
+  fi
+  (
+    export S_0="$kek"
+    local i=1 tok names=''
+    for id in $EGRESS_IDS; do
+      key="$(egress_key "$id")"
+      tok="$(json_value "$json" "$key")"
+      [[ -n "$tok" ]] || { log "generating the egress token of host $id"; tok="$(rand_hex)"; }
+      export "S_$i=$tok"
+      names+=" $key"
+      i=$((i + 1))
+    done
+    # shellcheck disable=SC2086 # one argument per key; the names are validated identifiers
+    apply_secret sbx-egress SH_CREDENTIAL_KEK $names
+  )
+  for id in $EGRESS_IDS; do want+="$(egress_key "$id") "; done
+  stale="$(printf '%s' "$json" | jq -r '.data // {} | keys[]' | while read -r k; do
+    [[ "$k" == SH_EGRESS_TOKEN_* && "$want" != *" $k "* ]] && printf '%s\n' "$k"
+    true
+  done)"
+  if [[ -n "$stale" ]]; then
+    log "revoking the egress token of host(s) no longer listed: $(printf '%s' "$stale" | tr '\n' ' ')"
+    patch="$(printf '%s\n' "$stale" | jq -Rnc '{data: ([inputs | {key: ., value: null}] | from_entries)}')"
+    kc patch secret sbx-egress -n "$NS" --type=merge -p "$patch" >/dev/null
+  fi
+}
+
 # apply_configmap NAME KEY=VALUE...: non-secret settings, so the values may appear in jq's argv
 # (never kubectl's). Server-side apply with the one field manager: a key dropped from the list is
 # removed, as SH_SANDBOX_EXEC_CA is once the exec certificate is issued.
@@ -378,7 +507,7 @@ apply_configmap() {
 # the relay's), then SETTINGS_HASH: what both pods read at boot, with the public keyset, so a change
 # to any of it rolls both (write_overlay). Runs after route_cert: it reads exec-ca.crt.
 ensure_settings() {
-  local ca='' moca sbx keys attach_crt exec_crt
+  local ca='' moca sbx keys attach_crt exec_crt egress
   [[ ! -f "$GEN/exec-ca.crt" ]] || ca="$(cat "$GEN/exec-ca.crt")"
   # The TTLs are '' (the control plane's defaults); the base reads both keys, so both must exist.
   moca=("SH_GITHUB_CLIENT_ID=$SBX_GITHUB_CLIENT_ID" "SH_ADMIN_SUBJECTS=${SBX_ADMIN_SUBJECTS:-}"
@@ -389,6 +518,10 @@ ensure_settings() {
     "SH_SANDBOX_RETENTION_SECONDS=$RETENTION_S" "SH_SANDBOX_MAX_PER_SUBJECT=$SBX_MAX_PER_SUBJECT"
     "SH_SANDBOX_MAX_TOTAL=$SBX_MAX_TOTAL" "SH_SANDBOX_MAX_INFLIGHT=$SBX_MAX_INFLIGHT")
   [[ -z "$ca" ]] || sbx+=("SH_SANDBOX_EXEC_CA=$ca")
+  if [[ -n "$EGRESS_ON" ]]; then
+    sbx+=("SH_EGRESS_HOSTS=$EGRESS_HOSTS_JSON")
+    [[ -z "${SBX_EGRESS_CREDENTIAL_TTL_SECONDS:-}" ]] || sbx+=("SH_EGRESS_CREDENTIAL_TTL_SECONDS=$SBX_EGRESS_CREDENTIAL_TTL_SECONDS")
+  fi
   apply_configmap moca-settings "${moca[@]}"
   apply_configmap sbx-settings "${sbx[@]}"
   # Captured first, so a failing `kubectl get` stops the run (errexit) rather than hashing without it.
@@ -397,11 +530,16 @@ ensure_settings() {
   keys="$(secret_json sbx-token-keys)"
   attach_crt="$(secret_json moca-relay-tls)"
   exec_crt="$(secret_json sbx-exec-tls)"
+  # With egress on, the Secret's data is hashed too (names and base64 values, sorted): a new host
+  # token or KEK changes the pod template, so the control plane rolls and rereads its files.
+  egress=''
+  [[ -z "$EGRESS_ON" ]] || egress="$(secret_json sbx-egress | jq -cS '.data // {}')"
   SETTINGS_HASH="$({
     printf '%s\n' "${moca[@]}" "${sbx[@]}"
     json_value "$keys" PUBLIC_KEYS
     json_value "$attach_crt" tls.crt
     json_value "$exec_crt" tls.crt
+    [[ -z "$EGRESS_ON" ]] || printf '%s\n' "$egress"
   } | openssl dgst -sha256 -hex | awk '{print substr($NF, 1, 16)}')"
   [[ "$SETTINGS_HASH" =~ ^[0-9a-f]{16}$ ]] || die 'could not hash the settings (openssl dgst)'
 }
@@ -467,7 +605,9 @@ write_overlay() {
   {
     printf '# GENERATED by deploy/sbx/setup.sh on every run. Do not edit; gitignored.\n'
     printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n'
-    printf 'namespace: %s\nresources:\n  - %s\npatches:\n' "$NS" "$OVERLAY_REL"
+    printf 'namespace: %s\nresources:\n  - %s\n' "$NS" "$OVERLAY_REL"
+    [[ -z "$EGRESS_ON" ]] || printf 'components:\n  - %s/egress-credentials\n' "$OVERLAY_REL"
+    printf 'patches:\n'
     printf '  - target: { kind: Route, name: moca-relay }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_ATTACH_HOST"
     printf '  - target: { kind: Route, name: sbx-exec }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_EXEC_HOST"
     printf '  - target: { kind: Route, name: sbx-api }\n    patch: |-\n      - { op: replace, path: /spec/host, value: %s }\n' "$SBX_API_HOST"
@@ -537,6 +677,7 @@ write_bundles() {
     chmod 700 "$GEN" "$GEN"/workers "$GEN"/workers/* 2>/dev/null || true
   )
   write_janitor_bundle
+  write_egress_bundles
   log "worker bundles: $GEN/workers/<id>  (copy to the KVM host, run deploy/sbx/install-host.sh, delete the copy)"
   log "janitor bundle: $GEN/janitor  (copy to every KVM host, run deploy/sbx/install-host.sh --janitor, delete the copy)"
   [[ -z "${HOSTS_TO_REINSTALL:-}" ]] ||
@@ -566,6 +707,42 @@ write_janitor_bundle() {
   )
 }
 
+# The egress bundle of each host (spec §6.2; install-host.sh --egress): egress.env (the API URL; no
+# secret), egress.token (the host's bearer alone, no newline) and, with SBX_API_CA_FILE, api-ca.crt.
+# Tokens are re-read from the Secret (ensure_egress_secrets ran in a subshell) and reach the files
+# through the printf builtin, never argv. A host no longer listed loses its directory.
+write_egress_bundles() {
+  [[ -n "$EGRESS_ON" ]] || return 0
+  local json d id tok
+  json="$(secret_json sbx-egress)"
+  for d in "$GEN"/egress/*/; do
+    [[ -d "$d" ]] || continue
+    id="$(basename "$d")"
+    [[ " $EGRESS_IDS " == *" $id "* ]] || { log "deleting the egress bundle of host $id"; rm -rf "$d"; }
+  done
+  (
+    umask 077
+    for id in $EGRESS_IDS; do
+      d="$GEN/egress/$id"
+      tok="$(json_value "$json" "$(egress_key "$id")")"
+      [[ "$tok" =~ ^[0-9a-f]{64}$ ]] || die "sbx-egress has no valid token for host $id: re-run setup.sh"
+      mkdir -p "$d"
+      chmod 700 "$GEN/egress" "$d"
+      printf 'MOCA_EGRESS_CREDENTIALS_URL=https://%s\n' "$SBX_API_HOST" >"$d/egress.env"
+      printf '%s' "$tok" >"$d/egress.token"
+      chmod 600 "$d/egress.env" "$d/egress.token"
+      if [[ -n "${SBX_API_CA_FILE:-}" ]]; then
+        cp "$SBX_API_CA_FILE" "$d/api-ca.crt.new" && chmod 600 "$d/api-ca.crt.new" && mv "$d/api-ca.crt.new" "$d/api-ca.crt"
+      else
+        rm -f "$d/api-ca.crt"
+      fi
+    done
+  )
+  for id in $EGRESS_IDS; do
+    log "egress bundle: $GEN/egress/$id  (copy to host $id, run deploy/sbx/install-host.sh --egress on it, delete the copy)"
+  done
+}
+
 main() {
   parse_args "$@"
   validate
@@ -575,6 +752,7 @@ main() {
   ensure_worker_tokens
   remove_client_tokens
   ensure_signing_key
+  ensure_egress_secrets
   route_cert moca-relay-tls "$SBX_ATTACH_HOST" "${SBX_ATTACH_TLS_CERT:-}" "${SBX_ATTACH_TLS_KEY:-}" "$GEN/attach-ca.crt"
   route_cert sbx-exec-tls "$SBX_EXEC_HOST" "${SBX_EXEC_TLS_CERT:-}" "${SBX_EXEC_TLS_KEY:-}" "$GEN/exec-ca.crt"
   ensure_settings

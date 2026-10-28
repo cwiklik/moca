@@ -1659,5 +1659,163 @@ check "at least one VMM arm calls check_egress_listener" \
 check "no network-interfaces config anywhere in the build" \
   "$(grep -c 'network-interfaces' "$SCRIPT")" "0"
 
+echo "== SBX0.2b: --egress-ca bakes the host's interception CA (public cert only) into the rootfs"
+EGT="$(mktemp -d "${TMPDIR:-/tmp}/bs-egress-test.XXXXXX")"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=moca test ca" \
+  -keyout "$EGT/ca.key" -out "$EGT/ca.crt" >/dev/null 2>&1
+cat "$EGT/ca.key" "$EGT/ca.crt" >"$EGT/both.pem"
+want_sha="sha256:$(openssl x509 -in "$EGT/ca.crt" -outform DER | sha256sum | cut -d' ' -f1)"
+
+# Run the script's own functions (extracted, comments stripped) against a fake staged tree.
+# chroot is stubbed to run the tool inside the tree path without needing root.
+eg_harness() { # $1 = tree kind (debian|rhel|none), $2 = work dir
+  local kind="$1" w="$2"
+  mkdir -p "$w/stage/rootfs-tree/sbin" "$w/stage/rootfs-tree/usr/sbin" "$w/stage/rootfs-tree/usr/bin"
+  cat >"$w/stage/rootfs-tree/sbin/init" <<'EOI'
+#!/bin/sh
+export GH_TOKEN=moca-placeholder
+export GITHUB_TOKEN=moca-placeholder
+
+exec /usr/local/bin/agent
+EOI
+  chmod 0555 "$w/stage/rootfs-tree/sbin/init"
+  local tool=""
+  [ "$kind" = debian ] && tool="$w/stage/rootfs-tree/usr/sbin/update-ca-certificates"
+  [ "$kind" = rhel ] && tool="$w/stage/rootfs-tree/usr/bin/update-ca-trust"
+  if [ -n "$tool" ]; then
+    printf '#!/bin/sh\necho "$0 $*" >> "%s/calls"\n' "$w" >"$tool"
+    chmod 0755 "$tool"
+  fi
+  {
+    echo 'log() { echo "$*" >&2; }'
+    echo 'chroot() { local t="$1"; shift; local c="$1"; shift; "$t$c" "$@"; }'
+    echo "STAGE='$w/stage'"
+    echo "EGRESS_CA='$EGT/ca.crt'"
+    fn_body validate_egress_ca
+    fn_body install_egress_ca
+    echo 'install_egress_ca'
+  } >"$w/run.sh"
+  bash "$w/run.sh" >"$w/out" 2>&1
+  echo $?
+}
+
+w="$EGT/deb"; mkdir -p "$w"
+check "debian tree: install_egress_ca succeeds" "$(eg_harness debian "$w")" "0"
+check "debian: CA lands in usr/local/share/ca-certificates" \
+  "$(cmp -s "$EGT/ca.crt" "$w/stage/rootfs-tree/usr/local/share/ca-certificates/moca-egress.crt" && echo yes || echo no)" "yes"
+check "debian: update-ca-certificates ran once" "$(grep -c update-ca-certificates "$w/calls")" "1"
+init="$w/stage/rootfs-tree/sbin/init"
+check "debian: init exports NODE_EXTRA_CA_CERTS" \
+  "$(grep -cFx 'export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/moca-egress.crt' "$init")" "1"
+check "debian: init exports SSL_CERT_FILE" \
+  "$(grep -cFx 'export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt' "$init")" "1"
+check "debian: init exports REQUESTS_CA_BUNDLE" \
+  "$(grep -cFx 'export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt' "$init")" "1"
+check "debian: the exports sit after GITHUB_TOKEN and before the exec" \
+  "$(awk '/GITHUB_TOKEN=/{g=NR} /NODE_EXTRA_CA_CERTS/{n=NR} /^exec /{e=NR} END{print (g<n && n<e) ? "yes":"no"}' "$init")" "yes"
+check "debian: init stays 0555" "$(stat -c %a "$init" 2>/dev/null || stat -f %Lp "$init")" "555"
+
+w="$EGT/rhel"; mkdir -p "$w"
+check "rhel tree: install_egress_ca succeeds" "$(eg_harness rhel "$w")" "0"
+check "rhel: CA lands in etc/pki/ca-trust/source/anchors" \
+  "$(cmp -s "$EGT/ca.crt" "$w/stage/rootfs-tree/etc/pki/ca-trust/source/anchors/moca-egress.crt" && echo yes || echo no)" "yes"
+check "rhel: update-ca-trust extract ran" "$(grep -c 'update-ca-trust extract' "$w/calls")" "1"
+init="$w/stage/rootfs-tree/sbin/init"
+check "rhel: NODE_EXTRA_CA_CERTS names the anchor" \
+  "$(grep -cFx 'export NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/moca-egress.crt' "$init")" "1"
+check "rhel: SSL_CERT_FILE is the RHEL bundle" \
+  "$(grep -cFx 'export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt' "$init")" "1"
+check "rhel: REQUESTS_CA_BUNDLE is the RHEL bundle" \
+  "$(grep -cFx 'export REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt' "$init")" "1"
+
+w="$EGT/none"; mkdir -p "$w"
+check "tree with neither tool: install_egress_ca fails" "$([ "$(eg_harness none "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "neither tool: the message is the documented one" \
+  "$(grep -cF -- '--egress-ca: the rootfs has neither update-ca-certificates nor update-ca-trust' "$w/out")" "1"
+
+echo "== SBX0.2b: the CA file is validated before anything is staged"
+mkdir -p "$EGT/tmp1"
+out=$(TMPDIR="$EGT/tmp1" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --image t --egress-ca "$EGT/ca.key" 2>&1); rc=$?
+check "a private key as --egress-ca is refused" "$([ "$rc" != 0 ] && echo yes || echo no)" "yes"
+check "the refusal names the private key" "$(printf '%s' "$out" | grep -c 'PRIVATE KEY')" "1"
+check "nothing was staged for the key" "$(find "$EGT/tmp1" -mindepth 1 | wc -l | tr -d ' ')" "0"
+out=$(TMPDIR="$EGT/tmp1" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --image t --egress-ca "$EGT/both.pem" 2>&1); rc=$?
+check "a cert+key bundle is refused" "$(printf '%s' "$out" | grep -c 'PRIVATE KEY')" "1"
+echo "not a cert" >"$EGT/junk.pem"
+out=$(TMPDIR="$EGT/tmp1" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --image t --egress-ca "$EGT/junk.pem" 2>&1); rc=$?
+check "an unparseable file is refused" "$([ "$rc" != 0 ] && echo yes || echo no)" "yes"
+check "nothing was staged for the junk" "$(find "$EGT/tmp1" -mindepth 1 | wc -l | tr -d ' ')" "0"
+out=$(TMPDIR="$EGT/tmp1" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --image t --egress-ca "$EGT/ca.crt" 2>&1)
+case "$out" in *"must run as root"* | *"/dev/kvm is not present"*) ok=yes ;; *) ok=no ;; esac
+check "a good cert passes arg validation" "$ok" "yes"
+
+echo "== SBX0.2b: more than one certificate is refused before staging"
+cat "$EGT/ca.crt" "$EGT/ca.crt" >"$EGT/two.pem"
+mkdir -p "$EGT/tmp2"
+out=$(TMPDIR="$EGT/tmp2" bash "$SCRIPT" --kernel /k --rootfs /r --agent /a --image t --egress-ca "$EGT/two.pem" 2>&1); rc=$?
+check "a two-certificate file is refused" "$([ "$rc" != 0 ] && echo yes || echo no)" "yes"
+check "the refusal says more than one certificate" "$(printf '%s' "$out" | grep -c 'more than one certificate')" "1"
+check "nothing was staged for the bundle" "$(find "$EGT/tmp2" -mindepth 1 | wc -l | tr -d ' ')" "0"
+
+echo "== SBX0.2b: the rewrite works on the REAL init heredoc, and anchor drift fails loudly"
+for drift in real drifted; do
+  w="$EGT/real-$drift"; mkdir -p "$w/stage/rootfs-tree/sbin" "$w/stage/rootfs-tree/usr/sbin"
+  printf '#!/bin/sh\necho "$0" >> "%s/calls"\n' "$w" >"$w/stage/rootfs-tree/usr/sbin/update-ca-certificates"
+  chmod 0755 "$w/stage/rootfs-tree/usr/sbin/update-ca-certificates"
+  # The init heredoc body, verbatim from build-snapshot.sh.
+  sed -n "/^  cat >\"\$STAGE\/rootfs-tree\/sbin\/init\" <<'INIT'\$/,/^INIT\$/p" "$SCRIPT" | sed '1d;$d' >"$w/stage/rootfs-tree/sbin/init"
+  [ "$drift" = drifted ] && sed -i.bak 's/^export GITHUB_TOKEN=moca-placeholder$/export GITHUB_TOKEN=changed/' "$w/stage/rootfs-tree/sbin/init"
+  {
+    echo 'chroot() { local t="$1"; shift; local c="$1"; shift; "$t$c" "$@"; }'
+    echo "STAGE='$w/stage'; EGRESS_CA='$EGT/ca.crt'"
+    fn_body install_egress_ca
+    echo 'install_egress_ca'
+  } >"$w/run.sh"
+  bash "$w/run.sh" >"$w/out" 2>&1; rc=$?
+  if [ "$drift" = real ]; then
+    check "real init: rewrite succeeds" "$rc" "0"
+    check "real init: all three exports present" \
+      "$(grep -cE '^export (NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|REQUESTS_CA_BUNDLE)=' "$w/stage/rootfs-tree/sbin/init")" "3"
+  else
+    check "drifted anchor: install_egress_ca fails" "$([ "$rc" != 0 ] && echo yes || echo no)" "yes"
+    check "drifted anchor: the message names the anchor" "$(grep -cF 'export GITHUB_TOKEN=moca-placeholder' "$w/out")" "1"
+  fi
+done
+
+echo "== SBX0.2b: the manifest fingerprint is the DER sha256, outside hash"
+mw="$EGT/mf"; mkdir -p "$mw/stage"
+for mode in with without; do
+  : >"$mw/stage/kernel"; : >"$mw/stage/rootfs"; : >"$mw/stage/agent"
+  {
+    echo 'log() { :; }'
+    echo "STAGE='$mw/stage'; IMAGE=i; VMM=firecracker; INSTANCE_TYPE=t; GUEST_RAM_MB=256; MANIFEST_CAPABILITIES=''"
+    if [ "$mode" = with ]; then
+      echo "EGRESS_CA='$EGT/ca.crt'"
+      fn_body validate_egress_ca
+      echo 'validate_egress_ca'
+    else
+      echo "EGRESS_CA=''"
+    fi
+    # fn_body stops at the first bare `}`, which is inside write_manifest's JSON heredoc.
+    sed -n '/^write_manifest() {/,/^MANIFEST$/p' "$SCRIPT"
+    echo '}'
+    echo 'write_manifest'
+  } >"$mw/run.sh"
+  bash "$mw/run.sh" >/dev/null 2>&1
+  cp "$mw/stage/manifest.json" "$mw/$mode.json"
+done
+check "manifest carries egress_ca_sha256 with the flag" \
+  "$(grep -cF "\"egress_ca_sha256\": \"$want_sha\"" "$mw/with.json")" "1"
+check "manifest has no egress_ca_sha256 without the flag" "$(grep -c egress_ca "$mw/without.json")" "0"
+check "the hash is unchanged by the field" \
+  "$(grep '"hash"' "$mw/with.json" | tr -d ',')" "$(grep '"hash"' "$mw/without.json")"
+check "the field comes after hash (outside it)" \
+  "$(awk '/"hash"/{h=NR} /egress_ca_sha256/{e=NR} END{print (h<e)?"yes":"no"}' "$mw/with.json")" "yes"
+check "the with-flag manifest is valid JSON" \
+  "$(python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$mw/with.json" && echo yes || echo no)" "yes"
+check "assemble_rootfs calls install_egress_ca only when the flag is set" \
+  "$(fn_body assemble_rootfs | grep -cF '[ -n "$EGRESS_CA" ] && install_egress_ca')" "1"
+rm -rf "$EGT"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

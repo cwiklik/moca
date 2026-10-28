@@ -1,7 +1,7 @@
 # SBX0.2b — User-scoped egress credentials for `mocactl sbx` microVMs — Design
 
-Version: 1.2 — October 27, 2026 (#624 review rounds 1–2: destinations, headers, resolver seam, presets, MCP; revocation per connection, path-confusion rule)
-Status: Proposed
+Version: 1.3 — October 27, 2026 (phase 1 implemented; §4.3 secret placement and setup.sh inputs corrected; §8 adds two accepted risks). 1.2: #624 review rounds 1–2: destinations, headers, resolver seam, presets, MCP; revocation per connection, path-confusion rule
+Status: Implemented (phase 1)
 Milestone: **SBX0.2b**, increment 2b of [SBX0](2026-10-15-sbx0-internal-sandbox-service-design.md)
 (§11), registered in [the milestone registry](README.md).
 Decision record: [ADR-0046](../adrs/0046-sbx-egress-credentials-owner-lookup.md).
@@ -231,14 +231,14 @@ short strings.
 
 ### 4.3 Settings and secrets
 
-| Setting                            | Where                      | Meaning                                                                                                                                                                                   |
-| ---------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SH_CREDENTIAL_STORE=file`         | `patch-control-plane.yaml` | Set on the sandbox profile, no longer deleted.                                                                                                                                            |
-| `SH_CREDENTIAL_DIR`                | same                       | `/var/lib/moca/credentials`, a PVC (`moca-sbx-credentials`, RWO, 1 GiB).                                                                                                                  |
-| `SH_CREDENTIAL_KEK`                | `moca-mu1` Secret, file    | Generated once by `deploy/sbx/setup.sh` **when credentials are enabled**, kept across re-runs like every other key there (setup.sh header, "generated once and kept").                    |
-| `SH_EGRESS_HOSTS`                  | `sbx-settings` ConfigMap   | JSON `[{id, workers: [...]}]`. Built by `setup.sh` from `SBX_EGRESS_HOSTS` (`host=w1,w2;host2=w3`). When unset, one host `kvm` owns every `SBX_WORKERS` entry, which is today's topology. |
-| `SH_EGRESS_TOKEN_<ID>`             | `moca-mu1` Secret, files   | One 32-byte random bearer per host, generated once. Written into that host's egress bundle (§5.3).                                                                                        |
-| `SH_EGRESS_CREDENTIAL_TTL_SECONDS` | `sbx-settings`             | Default 60.                                                                                                                                                                               |
+| Setting                            | Where                      | Meaning                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SH_CREDENTIAL_STORE=file`         | `patch-control-plane.yaml` | Set on the sandbox profile, no longer deleted.                                                                                                                                                                                                                                                                                               |
+| `SH_CREDENTIAL_DIR`                | same                       | `/var/lib/moca/credentials`, a PVC (`moca-sbx-credentials`, RWO, 1 GiB).                                                                                                                                                                                                                                                                     |
+| `SH_CREDENTIAL_KEK`                | `sbx-egress` Secret, file  | Generated once by `deploy/sbx/setup.sh` **when credentials are enabled**, kept across re-runs. The `sbx-egress` Secret is separate from `moca-mu1`, labelled `sbx.moca.dev/setup=true`, and projected into `/run/credentials`.                                                                                                               |
+| `SH_EGRESS_HOSTS`                  | `sbx-settings` ConfigMap   | JSON `[{id, workers: [...]}]`. Built by `setup.sh` from its `SBX_EGRESS_HOSTS` input (`kvm-a=sbx_default,sbx_py312;kvm-b=w3`; host ids `^[a-z0-9][a-z0-9-]{0,30}$`, every template worker, one listed in `SBX_TEMPLATES_FILE`, owned by exactly one host). When unset, one host `kvm` owns every template worker, which is today's topology. |
+| `SH_EGRESS_TOKEN_<ID>`             | `sbx-egress` Secret, files | One 32-byte random bearer per host, generated once. Written into that host's egress bundle (§5.3).                                                                                                                                                                                                                                           |
+| `SH_EGRESS_CREDENTIAL_TTL_SECONDS` | `sbx-settings`             | Default 60. Set from the `SBX_EGRESS_CREDENTIAL_TTL_SECONDS` setup.sh input (5-300).                                                                                                                                                                                                                                                         |
 
 **One switch.** `setup.sh` enables the feature only when `SBX_EGRESS_CREDENTIALS=1` is in its env
 file. Default is off, so a plain re-run against an existing deployment changes nothing: no KEK, no
@@ -433,8 +433,10 @@ the host and is a trust anchor, not a secret (P4 §5.2, Z5 E3).
   plus `egress.token` and an optional `api-ca.crt`) is installed with `--egress BUNDLE_DIR`, mirroring
   `--janitor`, under its own manifest kind.
 - `--egress-ca-out PATH` prints where the CA certificate is, for `build-snapshot.sh --egress-ca`.
-  Run order on a new host: `install-host.sh --egress …` → `build-snapshot.sh --egress-ca …` →
-  `install-host.sh BUNDLE --snapshot …`. `RUNBOOK.md` and the `sbx:install`/`sbx:upgrade` procedures
+  Run order on a fresh host: `install-host.sh --egress-ca-out` → `build-snapshot.sh --egress-ca …` →
+  `install-host.sh BUNDLE --snapshot …` → `install-host.sh --egress …` (`--egress` needs an installed
+  worker's `moca-egress`). On a host with a worker: `--egress` → `build-snapshot.sh --egress-ca …` →
+  re-install each worker. `RUNBOOK.md` and the `sbx:install`/`sbx:upgrade` procedures
   carry it.
 
 ### 6.3 Internal services and MCP servers
@@ -524,6 +526,16 @@ What bounds it:
 - Every issuance is audited in the control plane with the egress host's id, so off-host use or an
   unusual volume is visible after the fact.
 - Users scope their tokens (E8).
+
+Two further risks are accepted, and both are bounded by the user scoping the token (E8) and the
+operator allowlisting only trusted upstreams:
+
+- **A `Set-Cookie` minted from the injected token.** An upstream may answer an authenticated request
+  with a cookie derived from the token. It reaches the guest, and can outlive revocation until it
+  expires. Mitigation: a short-lived or narrowly scoped token, and a trusted-upstream allowlist.
+- **An upstream that echoes request headers into a response body** would return the token to the
+  guest. `TRACE` and `TRACK` are refused (405), but an application-level echo cannot be detected.
+  Mitigation: the same two controls.
 
 This is recorded as an accepted cost in ADR-0046 and is the reason phase 2 exists.
 

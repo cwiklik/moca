@@ -356,6 +356,50 @@ never a timeout. No credential is involved.
 - **Uninstalling** the last worker also stops and removes the `moca-egress.service` this script
   installed; an allowlist you edited stays (`kept ... (edited)`).
 
+### Credential injection (`--egress`)
+
+Prerequisite for both procedures: set `SBX_EGRESS_CREDENTIALS=1` (and optionally `SBX_EGRESS_HOSTS`)
+in `setup.sh`'s env file and run `setup.sh`. That writes `deploy/sbx/.generated/egress/<host id>/`
+(`egress.env`, `egress.token`, optional `api-ca.crt`); pass that `<host id>` directory to `--egress`,
+not its `egress/` parent. `--egress` generates the host's interception CA once (`/etc/sbx/egress/ca.crt`,
+`ca.key`), writes the token (0600) and the drop-in `moca-egress.service.d/sbx-credentials.conf`, then
+restarts `moca-egress`. It refuses a host whose `moca-egress.service` it did not install (the P6-owned
+unit is configured by its own installer) and a host with no worker yet (the unit comes with the first
+worker). `--egress-ca-out` prints the CA path (generating it if absent) and does nothing else. Once the
+drop-in exists, a snapshot whose `manifest.json` `egress_ca_sha256` is missing or differs is refused
+before systemd is touched.
+
+**Fresh host** (no worker installed):
+
+1. `sudo deploy/sbx/install-host.sh --egress-ca-out` (generates the CA).
+2. `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<image>`.
+3. `sudo deploy/sbx/install-host.sh WORKER_BUNDLE --snapshot <image>`.
+4. `sudo deploy/sbx/install-host.sh --egress .generated/egress/<host id>`.
+
+**Existing host** (worker already installed):
+
+1. `sudo deploy/sbx/install-host.sh --egress .generated/egress/<host id>`.
+2. `deploy/microvm/build-snapshot.sh --egress-ca /etc/sbx/egress/ca.crt --out /srv/sbx/snapshots/<new image>`.
+3. Re-install each worker with `--snapshot <new image>`.
+
+Between `--egress` and the reinstall, users with a stored credential see guest TLS failures on
+intercepted hosts, because the old snapshot does not trust the new CA. Do the reinstall promptly. The
+same applies to a CA rotation.
+
+The default allowlist (`MOCA_EGRESS_ALLOW`) does not include `api.githubcopilot.com`. Add it to
+`/etc/sbx/moca-egress.env` for the `github-mcp` preset, which otherwise gets `403 destination_denied`.
+
+**Turning credential injection off.** Run `install-host.sh --uninstall-egress` on every KVM host
+first, then run `setup.sh` with `SBX_EGRESS_CREDENTIALS=0`. With the cluster off, the lookup route is
+unmounted (404); a host that still has the drop-in treats the 404 as an error and answers
+`503 credential_unavailable` on every allowlisted request, including a plain `git clone` by users with
+no credential. The PVC and the `sbx-egress` Secret stay, so a later on-run finds the stored credentials
+again. The reverse rule: never run `--egress` against a cluster that is still off.
+
+A re-run keeps the CA. To rotate it, delete `/etc/sbx/egress/ca.crt` and `ca.key`, re-run `--egress`,
+then rebuild every snapshot (step 2). `--uninstall-egress` removes the drop-in, token and api CA and
+keeps the CA, because existing snapshots were built with it.
+
 ## 10. A KVM-host outage
 
 **What users see.** Every sandbox whose template runs on the host fails: `mocactl sbx run` and the
@@ -462,14 +506,29 @@ minutes, so 65 min with 60-minute tokens).
 | ------------------------------------------------------------------------ | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SBX_API_URL`                                                            | (required)                                   | `https://<api host>`                                                                                                                                                                                                                                                                                                                                                   |
 | `SBX_SMOKE_HOME_A`, `SBX_SMOKE_HOME_B`                                   | (required)                                   | the two logged-in `HOME`s; they must be two different users                                                                                                                                                                                                                                                                                                            |
+| `SBX_SMOKE_GITHUB_TOKEN_FILE`, `SBX_SMOKE_GITHUB_REPO`                   | (unset: step 7 is a SKIP)                    | step 7: a file holding a GitHub PAT (a fine-grained one that can push to the repository; one trailing newline is ignored; never an environment variable) and `OWNER/REPO`                                                                                                                                                                                              |
+| `SBX_SMOKE_CRED_TTL`                                                     | `60`                                         | the egress credential cache TTL (`SH_EGRESS_CREDENTIAL_TTL_SECONDS`); step 7 waits this plus 5 s after deleting the credential                                                                                                                                                                                                                                         |
+| `SBX_SMOKE_GITHUB_MCP`                                                   | (unset)                                      | `1`: step 7 also checks the `github-mcp` preset (`api.githubcopilot.com` must be in the host's egress allowlist)                                                                                                                                                                                                                                                       |
+| `SBX_SMOKE_CRED_TWO_USERS`                                               | (unset)                                      | `1`, with `SBX_SMOKE_HOME_B`: step 7 also checks that user B's sandbox gets a 401 and a public clone works; otherwise that check is a SKIP                                                                                                                                                                                                                             |
 | `SBX_SMOKE_TEMPLATE`                                                     | `default`                                    | the template every sandbox is created from                                                                                                                                                                                                                                                                                                                             |
-| `SBX_SMOKE_STEPS`                                                        | `1,2,3,4,5,6`                                | the steps to run; `1,2,5` leaves out the slow ones                                                                                                                                                                                                                                                                                                                     |
+| `SBX_SMOKE_STEPS`                                                        | `1,2,3,4,5,6,7`                              | the steps to run; `1,2,5` leaves out the slow ones                                                                                                                                                                                                                                                                                                                     |
 | `SBX_SMOKE_AGENTS`                                                       | `claude,opencode`                            | the agents step 5 runs, headless; one not on `PATH` is a SKIP. Each needs its own login and model configured                                                                                                                                                                                                                                                           |
 | `SBX_SMOKE_HOST`                                                         | (unset: step 6 is a SKIP)                    | an ssh target (`[user@]host`) for the template's KVM host, with passwordless `sudo`                                                                                                                                                                                                                                                                                    |
 | `SBX_SMOKE_HOST_ENV_DIR`, `SBX_SMOKE_HOST_SRV`, `SBX_SMOKE_HOST_LIBEXEC` | `/etc/sbx`, `/srv/sbx`, `/usr/local/libexec` | that host's `SBX_ENV_DIR`, `SBX_SRV` and `SBX_LIBEXEC_DIR`, if `install-host.sh` was given others                                                                                                                                                                                                                                                                      |
 | `SBX_SMOKE_JANITOR_AGE`                                                  | the host's own `SBX_JANITOR_AGE`             | step 6's janitor wait. The one run frees **every** workspace on the host terminated longer ago than this, other users' too, so it can only be lengthened: a value below the host's wait (which `setup.sh` keeps above the token lifetime + 30 s) is refused. Step 6 waits until its own deletion is that old: the host's wait, 65 min by default with 60-minute tokens |
 | `MOCACTL`                                                                | (unset: installed from the `edge` channel)   | a `mocactl` to test instead, such as a local build (`packages/mocactl/dist/mocactl.mjs`)                                                                                                                                                                                                                                                                               |
 | `SBX_SMOKE_PYTHON`                                                       | `python3`                                    | Python 3.10+ with `grpcio` and `grpcio-tools` (steps 2 and 4 use `docs/api/examples/sandbox_v1_client.py`). It also runs the sample repository's tests locally                                                                                                                                                                                                         |
+
+Step 7 (egress credentials, `SBX_EGRESS_CREDENTIALS=1`) runs alone with only user A's login:
+
+```bash
+SBX_LIVE_SMOKE=1 SBX_API_URL=https://<api host> SBX_SMOKE_HOME_A="$HOME" SBX_SMOKE_STEPS=7 \
+  SBX_SMOKE_GITHUB_TOKEN_FILE=~/.sbx-smoke-pat SBX_SMOKE_GITHUB_REPO=<owner>/<repo> deploy/sbx/smoke.sh
+```
+
+`SBX_SMOKE_HOME_B` stays required for steps 1 to 6. Step 7 prints the PAT nowhere and passes it to
+`mocactl` on stdin only; its trap deletes the credentials (`smoke-gh`, `smoke-gh-mcp`), the remote
+branch `sbx-smoke-<ts>` and the sandboxes, even on failure.
 
 What each step does:
 
@@ -500,6 +559,12 @@ What each step does:
    `/usr/local/libexec/sbx-janitor.sh` with the host's own `SBX_JANITOR_AGE` (or a longer
    `SBX_SMOKE_JANITOR_AGE`), after waiting until the deletion is that old. The installed timer
    and its settings are not changed. After the run, the directory must be gone.
+7. Needs the two GitHub variables, else it is a SKIP. User A stores the PAT
+   (`credentials add smoke-gh --preset github`, on stdin from the file). In A's sandbox it clones the
+   repository, commits, pushes `sbx-smoke-<ts>` and deletes it, and checks that `gh api user` (or
+   `curl`, without `gh`) names the PAT's owner. The placeholder sent from this machine must get a 401.
+   User A deletes the credential, the step waits `SBX_SMOKE_CRED_TTL` + 5 s, and the sandbox must get
+   a 401. Optionally `github-mcp`, and B's sandbox (401, public clone ok).
 
 What it cannot check for you: the agents' own logs (kept on a failure) show whether an agent
 fixed the test by the shortest route, or tried its local tools first and was denied. The

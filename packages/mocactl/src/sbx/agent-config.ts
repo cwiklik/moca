@@ -116,7 +116,15 @@ export const MARK_END = '<!-- sbx:end -->';
  * heading. Claude Code does not load this CLAUDE.md (the `Read` deny covers it), so what steers it
  * is the server's instructions; the block is the same text, for people and for OpenCode (#568).
  */
-export const RULES = ['## Working in the MOCA sandbox', '', MCP_INSTRUCTIONS].join('\n');
+export const GH_TOKEN_STEERING =
+  "GH_TOKEN in the sandbox is a placeholder that the host replaces with the user's token; never set, print or ask for a token.";
+export const RULES = [
+  '## Working in the MOCA sandbox',
+  '',
+  MCP_INSTRUCTIONS,
+  '',
+  GH_TOKEN_STEERING,
+].join('\n');
 
 /** The server name in every file: Claude Code's tools are then `mcp__sandbox__*`. */
 export const SERVER = 'sandbox';
