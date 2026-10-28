@@ -30,8 +30,9 @@
 #                           bundle per host. Unset or 0 changes nothing (a re-run is byte-identical);
 #                           turning it off later leaves sbx-egress and the PVC in place
 #   SBX_EGRESS_HOSTS        optional, with SBX_EGRESS_CREDENTIALS=1: kvm-a=sbx_default,sbx_py312;kvm-b=w3
-#                           (host ids ^[a-z0-9][a-z0-9-]{0,30}$; every SBX_WORKERS entry owned by exactly
-#                           one host). Unset: one host, kvm, owning every worker
+#                           (host ids ^[a-z0-9][a-z0-9-]{0,30}$; every template worker, one listed in
+#                           SBX_TEMPLATES_FILE, owned by exactly one host). Unset: one host, kvm,
+#                           owning every template worker
 #   SBX_EGRESS_CREDENTIAL_TTL_SECONDS   optional; 5-300 (the control plane's default is 60)
 #   SBX_WORKSPACE_IMAGE_MB  optional; default 2048 (microvm-worker's SH_WORKSPACE_IMAGE_MB)
 #   SBX_{ATTACH,EXEC,API}_TLS_{CERT,KEY}   optional; otherwise self-signed (attach, exec) or the
@@ -164,7 +165,7 @@ validate() {
 
 # SBX_EGRESS_CREDENTIALS and what it takes (spec §4.3). Sets EGRESS_ON, EGRESS_IDS (host ids, in
 # order), EGRESS_SPEC ("id=w1,w2" per host) and EGRESS_HOSTS_JSON, and checks the hosts against
-# SBX_WORKERS: each worker owned by exactly one host, so a bad list is refused before anything is applied.
+# the template workers: each owned by exactly one host, so a bad list is refused before anything is applied.
 EGRESS_ON=''
 EGRESS_IDS=''
 EGRESS_SPEC=''
@@ -447,8 +448,23 @@ ensure_egress_secrets() {
   json="$(secret_json sbx-egress)"
   kek="$(json_value "$json" SH_CREDENTIAL_KEK)"
   [[ -n "$kek" ]] || { log 'generating the credential KEK (SH_CREDENTIAL_KEK)'; kek="$(openssl rand -base64 32 | tr -d '\n')"; }
-  [[ "$(printf '%s' "$kek" | base64 --decode 2>/dev/null | wc -c | tr -d ' ')" == 32 ]] ||
+  # keksFromBase64 reads a comma-separated ring, newest first: every entry must be 32 bytes. An
+  # existing ring is never rewritten, and a bad one is not met with advice to delete it.
+  local entry n=0 bad=''
+  local -a ring
+  IFS=',' read -r -a ring <<<"$kek"
+  for entry in "${ring[@]}"; do
+    entry="${entry//[[:space:]]/}"
+    [[ -n "$entry" ]] || continue
+    n=$((n + 1))
+    [[ "$(printf '%s' "$entry" | base64 --decode 2>/dev/null | wc -c | tr -d ' ')" == 32 ]] || bad=1
+  done
+  if [[ -n "$bad" || "$n" == 0 ]]; then
+    if [[ "$kek" == *,* ]]; then
+      die 'sbx-egress SH_CREDENTIAL_KEK is a ring with an entry that is not 32 bytes of base64: fix that entry in the Secret by hand (every entry, newest first, must decode to 32 bytes)'
+    fi
     die 'sbx-egress SH_CREDENTIAL_KEK is not 32 bytes of base64: delete the key and re-run (this makes stored credentials unreadable)'
+  fi
   (
     export S_0="$kek"
     local i=1 tok names=''

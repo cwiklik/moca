@@ -88,7 +88,7 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx pull [--apply] [-o FILE]           the sandbox's changes as a patch, on stdout or in
                                                  FILE (--apply: apply it here, then advance the
                                                  sandbox's baseline)
-  mocactl sbx credentials [--json]              the credentials the host swaps into your sandboxes' HTTPS requests
+  mocactl sbx credentials [list] [--json]       the credentials the host swaps into your sandboxes' HTTPS requests
   mocactl sbx credentials add NAME (--host DEST ... [--kind K] | --preset ID)
                                                  store one (the secret is read from stdin, never argv);
                                                  DEST is host[:port][/prefix]; K: bearer (default), basic,
@@ -440,7 +440,9 @@ export async function sbxMain(
       ? arg === undefined ||
         (arg === 'presets'
           ? extra.length === 0
-          : ['add', 'delete'].includes(arg) && extra.length === 1)
+          : arg === 'list'
+            ? extra.length === 0
+            : ['add', 'delete'].includes(arg) && extra.length === 1)
       : command === 'put'
         ? arg !== undefined && extra.length === 0
         : extra.length === 0 && (arg === undefined || TAKES_ID_ARG.has(command)));
@@ -564,7 +566,7 @@ export async function sbxMain(
   }
 
   if (command === 'credentials') {
-    if (arg !== undefined && !['add', 'delete', 'presets'].includes(arg)) {
+    if (arg !== undefined && !['add', 'delete', 'presets', 'list'].includes(arg)) {
       io.err(`sbx: unknown credentials command '${sanitizeRemote(arg)}'\n${SBX_USAGE}`);
       return SBX_EXIT.usage;
     }

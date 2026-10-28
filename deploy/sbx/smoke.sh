@@ -727,8 +727,7 @@ step7() {
     [[ "$RC" == 0 ]] || fail "a public git ls-remote in user B's sandbox: exit $RC: $(lastline "$LOGS/cred-b-public.err")" || return 1
     release b "$bid" || return 1
   else
-    echo "ok 7 - B's sandbox gets a 401 and a public clone works # SKIP no second user"
-    SKIPS=$((SKIPS + 1))
+    echo '# step 7: second-user check skipped (no second user)'
   fi
   # Revocation: after the delete and the egress cache TTL, the sandbox is a 401.
   cred_del smoke-gh || return 1

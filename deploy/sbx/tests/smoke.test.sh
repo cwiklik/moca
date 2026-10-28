@@ -557,9 +557,10 @@ pass 'refuses a missing HOME_B for steps 1-6, a bad repository and a missing tok
 # A full single-user run.
 reset_state
 credrun >"$TMP/out" 2>&1 || fail "step 7 exited $?"
-has "ok 7 - B's sandbox gets a 401 and a public clone works # SKIP no second user"
+has '# step 7: second-user check skipped (no second user)'
+! grep -q "ok 7 - B's sandbox" "$TMP/out" || fail 'the second-user sub-step printed its own ok line'
 has 'ok 7 - egress credentials: the PAT works from the sandbox without being in it; the placeholder is inert; delete revokes'
-has '# 1 ok, 0 not ok, 7 skipped'
+has '# 1 ok, 0 not ok, 6 skipped'
 all_cleaned
 [[ "$(created)" == 1 ]] || fail "step 7 created $(created) sandboxes, not 1"
 grep -qx 'mocactl user=a url=https://api.sbx.example xdg= sbx credentials add smoke-gh --preset github' "$MOCK_LOG" || fail 'no credentials add with the github preset as A'
@@ -601,7 +602,8 @@ nopat
 # HOME_B alone, without SBX_SMOKE_CRED_TWO_USERS=1, is not used.
 reset_state
 credrun SBX_SMOKE_HOME_B="$TMP/home-b" >"$TMP/out" 2>&1 || fail "step 7 with an unused B exited $?"
-has "ok 7 - B's sandbox gets a 401 and a public clone works # SKIP no second user"
+has '# step 7: second-user check skipped (no second user)'
+! grep -q "ok 7 - B's sandbox" "$TMP/out" || fail 'the second-user sub-step printed its own ok line'
 ! grep -q 'user=b' "$MOCK_LOG" || fail 'B was used without SBX_SMOKE_CRED_TWO_USERS=1'
 pass "step 7's B check runs only with HOME_B and SBX_SMOKE_CRED_TWO_USERS=1"
 

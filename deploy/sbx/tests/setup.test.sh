@@ -736,6 +736,23 @@ render
 [[ "$(pod_hash moca-control-plane)" != "$h_on" ]] || fail 'a new host token did not move the settings hash'
 pass 'a new host token moves the settings hash, so the control plane rolls'
 
+# The control plane's keksFromBase64 accepts a comma-separated ring, newest first: setup keeps it as is,
+# and refuses a bad entry without telling the operator to delete a ring.
+k1="$(openssl rand -base64 32 | tr -d '\n')"
+k2="$(openssl rand -base64 32 | tr -d '\n')"
+ring="$k1,$k2"
+set_kek() { jq --arg v "$(printf '%s' "$1" | base64 | tr -d '\n')" '.data.SH_CREDENTIAL_KEK = $v' "$MOCK_STATE/secret-sbx-egress.json" >"$TMP/eg.json" && mv "$TMP/eg.json" "$MOCK_STATE/secret-sbx-egress.json"; }
+set_kek "$ring"
+run_setup "${EG[@]}" || fail 'a two-entry KEK ring was refused'
+[[ "$(secret_val sbx-egress SH_CREDENTIAL_KEK)" == "$ring" ]] || fail 'a re-run rewrote the KEK ring'
+set_kek "$k1,c2hvcnQ="
+! run_setup "${EG[@]}" || fail 'a ring with a short entry was accepted'
+grep -q 'SH_CREDENTIAL_KEK' "$TMP/out" || fail 'the refusal does not name SH_CREDENTIAL_KEK'
+! grep -qi 'delete' "$TMP/out" || fail 'a ring refusal advises deleting the key'
+[[ "$(secret_val sbx-egress SH_CREDENTIAL_KEK)" == "$k1,c2hvcnQ=" ]] || fail 'a refused ring was rewritten'
+set_kek "$kek"
+pass 'a KEK ring is kept across a re-run; a bad ring entry is refused with no deletion advice'
+
 # 14c. Several hosts, a hyphenated id pinned to the TypeScript mapping (egressTokenEnvName), the TTL,
 # the API CA; dropping a host revokes its token and deletes its bundle; the KEK and the others stay.
 reset_state

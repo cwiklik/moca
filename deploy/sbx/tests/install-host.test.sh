@@ -528,6 +528,20 @@ snap_with fpok "$FP1"
 bash "$INSTALL" "$(bundle sbx_cr)" --snapshot fpok >"$TMP/out" 2>&1 || fail 'refused a matching fingerprint'
 pass 'a worker install refuses a missing or mismatched egress_ca_sha256 before systemctl, and accepts a match'
 
+# --egress warns (never refuses: the fresh-host order installs the worker first) for each installed
+# worker whose snapshot does not trust this host's CA. sbx_cr now runs fpok, which does.
+bash "$INSTALL" --egress "$(ebundle)" >"$TMP/out" 2>&1 || fail '--egress with a trusting worker snapshot'
+! grep -q 'WARNING' "$TMP/out" || fail "warned although the worker's snapshot trusts the CA"
+for case in missing mismatch; do
+  snap_with fpwarn "$([[ $case == mismatch ]] && printf '%064d' 1)"
+  sed -i.bak 's/^SH_SNAPSHOT_IMAGE=.*/SH_SNAPSHOT_IMAGE=fpwarn/' "$SBX_ENV_DIR/workers/sbx_cr.env" && rm -f "$SBX_ENV_DIR/workers/sbx_cr.env.bak"
+  bash "$INSTALL" --egress "$(ebundle)" >"$TMP/out" 2>&1 || fail "--egress refused a $case fingerprint (it must only warn)"
+  grep -qF "WARNING: worker sbx_cr runs snapshot fpwarn, which does not trust this host's CA; guests will see TLS failures on intercepted hosts until it is reinstalled on a snapshot built with --egress-ca" "$TMP/out" ||
+    fail "no warning for a $case fingerprint"
+done
+sed -i.bak 's/^SH_SNAPSHOT_IMAGE=.*/SH_SNAPSHOT_IMAGE=fpok/' "$SBX_ENV_DIR/workers/sbx_cr.env" && rm -f "$SBX_ENV_DIR/workers/sbx_cr.env.bak"
+pass '--egress warns for a worker whose snapshot lacks or mismatches the CA fingerprint, and stays quiet for a match'
+
 # Uninstall: the drop-in, token and api CA go; the CA stays.
 bash "$INSTALL" --egress "$(ebundle api)" >"$TMP/out" 2>&1 || fail '--egress for the uninstall case'
 : >"$MOCK_LOG"

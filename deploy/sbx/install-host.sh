@@ -249,14 +249,20 @@ ensure_host_ca() {
   record "egress credential $key"
 }
 
+# snapshot_ca_fingerprint IMAGE -> the egress_ca_sha256 recorded in the snapshot's manifest.json, or nothing.
+snapshot_ca_fingerprint() {
+  local m="$SBX_SRV/snapshots/$1/manifest.json"
+  [[ -f "$m" ]] || return 0
+  sed -n 's/.*"egress_ca_sha256"[[:space:]]*:[[:space:]]*"sha256:\([0-9a-f]\{64\}\)".*/\1/p' "$m" | head -1
+}
+
 # check_snapshot_ca: with credentials on (the drop-in exists) the snapshot must trust this host's CA.
 check_snapshot_ca() {
   [[ -f "$(egress_dropin)" ]] || return 0
   local crt m want got
   crt="$(EGRESS_CRED_DIR)/ca.crt" m="$SBX_SRV/snapshots/$SNAPSHOT/manifest.json"
   want="$([[ -f "$crt" ]] && ca_fingerprint "$crt" || true)"
-  got=''
-  [[ ! -f "$m" ]] || got="$(sed -n 's/.*"egress_ca_sha256"[[:space:]]*:[[:space:]]*"sha256:\([0-9a-f]\{64\}\)".*/\1/p' "$m" | head -1)"
+  got="$(snapshot_ca_fingerprint "$SNAPSHOT")"
   [[ -n "$want" && "$got" == "$want" ]] ||
     die "snapshot $SNAPSHOT does not trust this host's egress CA (egress_ca_sha256 in $m is missing or differs): rebuild it with deploy/microvm/build-snapshot.sh --egress-ca $crt --out $SBX_SRV/snapshots/<new image>"
 }
@@ -312,7 +318,23 @@ install_egress_credentials() {
   systemctl reset-failed moca-egress.service || true
   systemctl restart moca-egress.service || die 'moca-egress failed to start with credentials; the reason is in: journalctl -u moca-egress. Fix it and re-run'
   wait_egress_ready "$SBX_ENV_DIR/moca-egress.env"
+  warn_untrusting_workers
   log "moca-egress now injects credentials; build snapshots with: deploy/microvm/build-snapshot.sh --egress-ca $d/ca.crt --out $SBX_SRV/snapshots/<image>"
+}
+
+# warn_untrusting_workers: a warning, not a refusal, because the fresh-host order installs the worker first.
+warn_untrusting_workers() {
+  local want f id img got
+  want="$(ca_fingerprint "$(EGRESS_CRED_DIR)/ca.crt")"
+  for f in "$SBX_ENV_DIR"/workers/*.env; do
+    [[ -f "$f" ]] || continue
+    id="$(basename "$f" .env)"
+    img="$(env_value SH_SNAPSHOT_IMAGE "$f")"
+    [[ -n "$img" ]] || continue
+    got="$(snapshot_ca_fingerprint "$img")"
+    [[ -n "$got" && "$got" == "$want" ]] ||
+      printf "WARNING: worker %s runs snapshot %s, which does not trust this host's CA; guests will see TLS failures on intercepted hosts until it is reinstalled on a snapshot built with --egress-ca\n" "$id" "$img" >&2
+  done
 }
 
 # remove_credential_file PATH: the drop-in, token and api CA go; the host CA stays (snapshots carry it).

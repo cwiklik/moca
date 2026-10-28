@@ -300,6 +300,17 @@ describe('mocactl sbx credentials list and delete', () => {
     expect(out).not.toContain(PAT);
   });
 
+  it('accepts `credentials list` as the bare listing, and refuses extra arguments', async () => {
+    const r = run(['credentials', 'list'], {
+      'GET /v1/credentials': () => ({ status: 200, body: listed }),
+    });
+    expect(await r.code).toBe(0);
+    expect(r.s.io.outs.join('')).toContain('github.com,api.github.com');
+    const bad = run(['credentials', 'list', 'extra'], {});
+    expect(await bad.code).toBe(2);
+    expect(bad.cp.calls).toEqual([]);
+  });
+
   it('deletes a credential it lists', async () => {
     const r = run(['credentials', 'delete', 'github'], {
       'GET /v1/credentials': () => ({ status: 200, body: listed }),

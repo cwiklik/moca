@@ -112,8 +112,8 @@ sandbox token (§1.1), and every attach its worker's relay token.
 
 ### 2.1 Egress credentials (SBX0.2b, [spec](../specs/2026-10-26-sbx-egress-credentials-design.md))
 
-Rows for the user-scoped credential injection. The live rows are **open**: the live acceptance
-(plan Task 15) has not run, so none of them claims evidence yet.
+Rows for the user-scoped credential injection. The live acceptance (plan Task 15) ran on
+2026-10-28: two rows carry its evidence, and only the second-user row is still pending.
 
 | Claim                                                                                                                            | Evidence                                                                                | Status                                                                                                                                                                                                      |
 | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
