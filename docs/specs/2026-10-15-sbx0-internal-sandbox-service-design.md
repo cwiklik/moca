@@ -479,7 +479,8 @@ persistence follows the existing `base/redis.yaml`.
 - **`pull --apply` refuses a patch that writes `.git`, `.sbx/` or the agent-configuration and
   local-hook files** (`.mcp.json`, `.claude/`, `opencode.json(c)`, `.opencode/`, `.codex/`,
   `.agents/` (Codex CLI's repo skills), `.pi/` (Pi loads project-local `extensions/`, `skills/` and
-  `prompts/`), `.vscode/tasks.json`, `.vscode/settings.json`, `.husky/`, `.envrc`, or `.vscode`
+  `prompts/`), `.bob/` (IBM Bob's settings, which can start MCP servers),
+  `.vscode/tasks.json`, `.vscode/settings.json`, `.husky/`, `.envrc`, or `.vscode`
   itself), on either side of a rename or copy, at any depth and under case and Unicode folding. A
   change to `CLAUDE.md`, `AGENTS.md` or `AGENTS.override.md` (Codex reads it in preference to
   `AGENTS.md`) outside the `sbx up` block is applied with a warning.
