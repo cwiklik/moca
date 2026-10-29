@@ -654,6 +654,22 @@ grep -qF -- "--from-file=mock-anthropic.mjs=$REPO/deploy/microvm/mock-anthropic.
 [[ "$(replicas_of moca-control-plane)" == 1 ]] || fail 'kind-ci must run the control plane'
 pass 'kind-ci: mock model ConfigMap, placeholder client id, control plane on'
 
+# #429: kind and kind-ci share one cluster, hence one moca-settings. The placeholder above is
+# therefore the one setting that must NOT be sticky -- a kind re-run that inherited it would come up
+# at 1 replica with an id nobody can log in with, and no warning. No reset_state between the runs:
+# the leftover store IS the bug. The suite's top-level unset does not cover SH_GITHUB_CLIENT_ID.
+ci_h="$(settings_hash)"
+(unset SH_GITHUB_CLIENT_ID; expect_ok --target kind --skip-build)
+[[ "$(setting SH_GITHUB_CLIENT_ID)" != Iv1.k8s-smoke-unused ]] || fail 'kind inherited the kind-ci placeholder client id (#429)'
+[[ "$(replicas_of moca-control-plane)" == 0 ]] || fail 'kind ran the control plane on the kind-ci placeholder id (#429)'
+expect_out 'no SH_GITHUB_CLIENT_ID'
+# The other half: the filter must not cost kind-ci its convergence. It re-derives the same string,
+# so a second kind-ci run still hashes identically and rolls no pod (README §"re-run ... converges").
+expect_ok --target kind-ci --skip-build
+[[ "$(setting SH_GITHUB_CLIENT_ID)" == Iv1.k8s-smoke-unused ]] || fail 'the kind-ci placeholder was not re-derived after a kind run cleared it'
+[[ "$(settings_hash)" == "$ci_h" ]] || fail 'a kind-ci re-run changed the settings hash (it would roll the control plane for nothing)'
+pass 'the kind-ci placeholder does not leak into kind, and kind-ci still converges on it (#429)'
+
 reset_state
 (export SH_GITHUB_CLIENT_ID=Iv1.a; expect_ok --target ocp)
 [[ "$(grep -c '^oc adm policy add-scc-to-user nonroot-v2' "$MOCK_LOG")" == 5 ]] || fail 'expected 5 SCC grants'

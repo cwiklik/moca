@@ -155,7 +155,8 @@ re-running with just that one:
   **clears** it: `SH_ADMIN_SUBJECTS= deploy/k8s/setup.sh ...` removes every admin,
   `SH_GITHUB_CLIENT_ID=` takes the control plane back to 0 replicas, and an empty token lifetime is
   the control plane's default (900 seconds for the API token a login gets, 300 for a session
-  token). A lifetime is a whole number of seconds; a change rolls the control plane.
+  token). A lifetime is a whole number of seconds; a change rolls the control plane. The one
+  exception to stickiness is `kind-ci`'s placeholder client id, described under the CI variant below.
 - `SH_MODEL_CATALOG_HOSTS` lives in `moca-settings` too: the comma-separated **bare hostnames**
   the control plane's model catalog may contact besides `api.anthropic.com` and the default
   inference endpoint -- add each gateway your users' inference credentials name
@@ -197,6 +198,11 @@ placeholder client id, so the smoke can drive real turns with no model key and n
 deploy/k8s/setup.sh --target kind-ci --build
 K8S_LIVE_SMOKE=1 deploy/k8s/smoke.sh --target kind-ci
 ```
+
+That placeholder is the one setting that is **not** sticky, because both kind targets share one
+cluster and so one `moca-settings`: a later `--target kind` run discards it and goes back to 0
+control-plane replicas, rather than coming up with an id nobody can log in with. Give that run a
+real `SH_GITHUB_CLIENT_ID` to log in.
 
 ## 3. The front door is L4
 
