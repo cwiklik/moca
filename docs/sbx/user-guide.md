@@ -90,7 +90,17 @@ another `git worktree` of the same repository, gets a sandbox of its own at its 
 two agents in two worktrees never share, or overwrite, one tree. Each counts toward your quota
 of sandboxes ([Limits](#7-limits)): `mocactl sbx rm` the ones you are done with.
 
-**Run your agent** in the repository, as you normally do:
+**Run your agent** in the repository. Four are supported, and they differ in how they are wired and
+in how much `up` can take away:
+
+| Agent                       | How it gets the server                                    | Its local tools                                                |
+| --------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| **Claude Code**             | `up` writes `.mcp.json` + `.claude/settings.json`         | Denied (`permissions.deny`), or left to Cortex with `--cortex` |
+| **OpenCode**                | `up` writes `opencode.json`                               | Denied (`tools.<name>: false`)                                 |
+| **[Codex CLI](#codex-cli)** | `mocactl sbx codex`, per run — it reads no project config | Shell tool off; `unified_exec` cannot be disabled              |
+| **[IBM Bob](#ibm-bob)**     | `up` writes `.bob/settings.json`                          | **Not denied** — Bob has no deny list                          |
+
+The first two need nothing beyond `up`, so start them as you normally do:
 
 ```bash
 claude
@@ -131,6 +141,30 @@ opencode run "Fix the failing test and run the suite"
 ```
 
 ### Codex CLI
+
+Start to finish, in a repository you have already run `mocactl sbx up` in:
+
+```bash
+# 1. install Codex (Node.js 22 or later, the same floor as mocactl)
+npm install -g @openai/codex
+
+# 2. give it credentials — its own account, not your sandbox login
+codex login                      # a ChatGPT plan, in a browser
+# or: export OPENAI_API_KEY=...  and skip the login
+
+# 3. check it took
+codex doctor | grep -A3 "auth "  # expect: ✓ auth
+
+# 4. run it against the sandbox (mocactl passes the server; nothing is written)
+mocactl sbx codex -- "Run the test suite and fix what fails"
+
+# 5. bring the work back
+mocactl sbx pull --apply
+```
+
+There is no step for configuring Codex, because there is nothing to configure: `mocactl sbx codex`
+passes the server on the command line for that one run. The rest of this section is why, and what
+to check when a step does not behave.
 
 **Install it** (Node.js 22 or later, the same floor as `mocactl`):
 
@@ -227,6 +261,35 @@ behind it. Codex's own sandbox is the protection that remains: add `-c sandbox_m
 if you want its filesystem confinement as well.
 
 ### IBM Bob
+
+Start to finish, in a repository you have already run `mocactl sbx up` in:
+
+```bash
+# 1. install Bob-Shell: https://bob.ibm.com/docs/ide/getting-started/install
+bob --version
+
+# 2. log in (Bob's own account, not your sandbox login)
+bob --auth-method sso            # or --auth-method api-key
+
+# 3. check up wired it, and that Bob can start the server
+cat .bob/settings.json           # expect mcpServers.sandbox
+bob mcp list                     # expect: ✓ sandbox: mocactl sbx mcp (stdio) - Connected
+mocactl sbx doctor | grep 'agent config'
+
+# 4. run it, from the repository root
+bob "Run the test suite and fix what fails"
+
+# 5. bring the work back
+mocactl sbx pull --apply
+```
+
+If step 3 shows no `sandbox` server, run `mocactl sbx up` again — it merges the entry into
+`.bob/settings.json`. If it shows `Disconnected`, Bob found the entry but could not start it: check
+that `mocactl` is on your `PATH`, since that is the command Bob runs.
+
+Unlike Codex there is no launcher, because `up` can configure Bob; and unlike Claude Code and
+OpenCode, **`up` cannot take Bob's own tools away** — see the warning below before using it
+unattended.
 
 Install Bob-Shell per [its install guide](https://bob.ibm.com/docs/ide/getting-started/install),
 then start it in the repository as you would the others:
