@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 // sandbox-client's POSIX single quotes: safe to `eval`, whatever the control plane sent.
 import { q } from '@moca/sandbox-client';
@@ -6,7 +6,7 @@ import { ApiError, TOKEN_CODES } from '../api/errors.js';
 import { deviceLogin, toCachedAuth } from '../core/auth.js';
 import { describeError } from '../core/messages.js';
 import { sanitizeRemote } from '../core/sanitize.js';
-import { saveConfig } from '../config.js';
+import { saveConfig, storedLoginUrl } from '../config.js';
 import { deviceLoginEnd, devicePrompt, type Io, type LoginHelpers } from '../headless.js';
 import { setAuth, type RefreshFailure, type Runtime } from '../runtime.js';
 import type { SandboxApiClient, SbxDiscovery, SbxSandbox } from './api.js';
@@ -161,17 +161,6 @@ export async function cmdLogout(c: SbxCtx): Promise<number> {
     c.io.err(auth ? 'logged out of the sandbox service' : 'not logged in to the sandbox service');
   }
   return code;
-}
-
-/** The control-plane URL of the login stored in `file`, whatever URL it is for. */
-function storedLoginUrl(file: string): string | undefined {
-  try {
-    const u = (JSON.parse(readFileSync(file, 'utf8')) as { controlPlaneUrl?: unknown })
-      .controlPlaneUrl;
-    return typeof u === 'string' ? u : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 const when = (epochS: number) => new Date(epochS * 1000).toISOString();

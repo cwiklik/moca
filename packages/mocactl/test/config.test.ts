@@ -21,6 +21,7 @@ import {
   resolvePaths,
   saveAuth,
   saveConfig,
+  storedLoginUrl,
   type CachedAuth,
 } from '../src/config.js';
 
@@ -154,6 +155,49 @@ describe('auth cache', () => {
     saveAuth(paths, auth);
     expect(loadAuth(paths, 'http://cp')?.apiToken).toBe('tok');
     expect(loadAuth(paths, 'http://other')).toBeNull();
+  });
+
+  // #529: the stored URL and the one in use are the same control plane spelled differently
+  // (config.json vs SH_CONTROL_PLANE_URL), and the login was being thrown away -- reported as "the
+  // token only lasts an hour", because the refresh token was never presented at all.
+  it('uses a cached login whose URL differs only in spelling (#529)', () => {
+    const paths = resolvePaths({}, tmpHome());
+    for (const stored of ['http://cp', 'http://CP', 'http://cp:80', 'HTTP://cp', 'http://cp/']) {
+      saveAuth(paths, { ...auth, controlPlaneUrl: stored });
+      expect(loadAuth(paths, 'http://cp')?.apiToken, stored).toBe('tok');
+      expect(loadAuth(paths, 'http://CP:80/')?.apiToken, stored).toBe('tok');
+    }
+    saveAuth(paths, { ...auth, controlPlaneUrl: 'https://cp:443' });
+    expect(loadAuth(paths, 'https://cp')?.apiToken).toBe('tok');
+    saveAuth(paths, { ...auth, controlPlaneUrl: 'http://h/cp/' });
+    expect(loadAuth(paths, 'http://h/cp')?.apiToken).toBe('tok');
+  });
+
+  // The other half of #529, and the one that matters more: a token is still only ever sent to the
+  // control plane that issued it (spec §4.6). Only the spelling got more tolerant, not the endpoint.
+  it('still refuses a login for a genuinely different control plane (#529)', () => {
+    const paths = resolvePaths({}, tmpHome());
+    const refusals: Array<[string, string]> = [
+      ['http://h/cp', 'http://h/other'], // a path prefix is load-bearing: two control planes
+      ['http://h/cp', 'http://h'], // ...and so is having one at all
+      ['http://cp', 'https://cp'], // scheme
+      ['http://cp', 'http://other'], // host
+      ['http://cp:8080', 'http://cp'], // a non-default port is part of the endpoint
+      ['http://localhost', 'http://127.0.0.1'], // the same host only by convention
+      ['not-a-url', 'also-not-a-url'], // unparseable: equal to itself and nothing else
+    ];
+    for (const [stored, target] of refusals) {
+      saveAuth(paths, { ...auth, controlPlaneUrl: stored });
+      expect(loadAuth(paths, target), `${stored} vs ${target}`).toBeNull();
+      expect(loadAuth(paths, stored)?.apiToken, stored).toBe('tok');
+    }
+  });
+
+  it('storedLoginUrl reports the stored URL whatever control plane it is for', () => {
+    const paths = resolvePaths({}, tmpHome());
+    expect(storedLoginUrl(paths.authFile)).toBeUndefined();
+    saveAuth(paths, { ...auth, controlPlaneUrl: 'http://cp-a' });
+    expect(storedLoginUrl(paths.authFile)).toBe('http://cp-a');
   });
 
   it('clearAuth removes the file and is idempotent', () => {

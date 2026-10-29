@@ -152,13 +152,71 @@ export interface CachedAuth {
   refreshExpiresAt?: number;
 }
 
+/**
+ * One control-plane URL as its canonical form, for comparison only -- never for display, and never
+ * for what goes on the wire (`ControlPlaneClient` joins `base + path`, so the base is kept verbatim).
+ *
+ * `origin` lowercases the scheme and host and drops a port that is the scheme's default, which is
+ * the whole of what #529 was about. The PATH is kept: a control-plane base may carry a prefix
+ * (`http://h/cp`), and two prefixes on one host are two different control planes -- comparing bare
+ * `origin`, as #529 first proposed, would hand one's refresh token to the other. Query and fragment
+ * are ignored; a base carries neither.
+ */
+function canonicalControlPlaneUrl(u: string): string | undefined {
+  try {
+    const url = new URL(u);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined;
+    return url.origin + trimTrailingSlashes(url.pathname);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether two control-plane URLs name the same control plane -- the same login, in other words, so
+ * a difference in spelling alone no longer looks like a different deployment (#529). What is NOT the
+ * same: a different host, scheme or path prefix, and `localhost` vs `127.0.0.1` (the same host only
+ * by convention, and a refresh token is not something to hand over on a convention).
+ *
+ * Anything `new URL()` cannot parse falls back to the exact compare this replaced, so a string that
+ * is not a URL still matches itself and nothing widens by accident.
+ */
+export function sameControlPlane(a: string, b: string): boolean {
+  if (a === b) return true;
+  const ca = canonicalControlPlaneUrl(a);
+  return ca !== undefined && ca === canonicalControlPlaneUrl(b);
+}
+
 export function loadAuth(paths: Paths, controlPlaneUrl: string): CachedAuth | null {
   try {
     const auth = JSON.parse(readFileSync(paths.authFile, 'utf8')) as CachedAuth;
-    if (typeof auth.apiToken !== 'string' || auth.controlPlaneUrl !== controlPlaneUrl) return null;
+    if (typeof auth.apiToken !== 'string') return null;
+    // A token is only ever sent to the control plane that issued it (spec §4.6), but "the same
+    // control plane" is about the endpoint, not about how it was typed (#529).
+    if (
+      typeof auth.controlPlaneUrl !== 'string' ||
+      !sameControlPlane(auth.controlPlaneUrl, controlPlaneUrl)
+    ) {
+      return null;
+    }
     return auth;
   } catch {
     return null;
+  }
+}
+
+/**
+ * The control-plane URL of the login stored in `file`, whatever URL it is for -- so a gate that
+ * `loadAuth` just refused can say WHICH control plane the login on this machine belongs to, instead
+ * of a bare "not logged in" that sends the user to log in again and overwrite it (#529).
+ */
+export function storedLoginUrl(file: string): string | undefined {
+  try {
+    const u = (JSON.parse(readFileSync(file, 'utf8')) as { controlPlaneUrl?: unknown })
+      .controlPlaneUrl;
+    return typeof u === 'string' ? u : undefined;
+  } catch {
+    return undefined;
   }
 }
 

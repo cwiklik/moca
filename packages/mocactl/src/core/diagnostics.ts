@@ -1,5 +1,6 @@
 import type { ControlPlaneApi, HarnessApi } from '../api/types.js';
 import { describeError } from './messages.js';
+import { sanitizeRemote } from './sanitize.js';
 
 export interface CheckResult {
   id: number;
@@ -17,6 +18,12 @@ export interface DiagnosticsDeps {
   /** True when a local --harness-url / SH_HARNESS_URL / config value replaces discovery. */
   harnessOverridden: boolean;
   loggedIn: boolean;
+  /**
+   * The control-plane URL of a cached login that is NOT for `controlPlaneUrl` -- the reason the
+   * "logged in" check fails while auth.json does hold a login (#529). Undefined when there is no
+   * login at all, or when the one on disk is for this control plane.
+   */
+  storedLoginUrl?: string;
 }
 
 export const DIAGNOSTIC_NAMES = [
@@ -50,10 +57,21 @@ export async function runDiagnostics(deps: DiagnosticsDeps): Promise<CheckResult
     },
     {
       run: async () => {
-        if (!deps.loggedIn) throw new Error('no cached login');
+        if (!deps.loggedIn) {
+          // Naming the other control plane is the whole point (#529): a bare "no cached login"
+          // sent the user to log in again, overwriting the one login auth.json holds.
+          throw new Error(
+            deps.storedLoginUrl
+              ? `the cached login is for ${sanitizeRemote(deps.storedLoginUrl)}, not ${sanitizeRemote(deps.controlPlaneUrl)}`
+              : 'no cached login',
+          );
+        }
         await deps.cp.me();
       },
-      fix: 'not logged in — run `mocactl login`, or start `mocactl` to log in',
+      fix: deps.storedLoginUrl
+        ? `auth.json holds a login for ${sanitizeRemote(deps.storedLoginUrl)}, but this run targets ` +
+          `${sanitizeRemote(deps.controlPlaneUrl)} — use one URL (--control-plane-url / SH_CONTROL_PLANE_URL / config.json) or run \`mocactl login\``
+        : 'not logged in — run `mocactl login`, or start `mocactl` to log in',
     },
     {
       run: async () => {
