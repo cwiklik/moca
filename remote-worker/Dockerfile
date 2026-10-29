@@ -79,8 +79,9 @@ RUN set -eux; \
 # repositories, and adding GitHub's own dnf repo would put a third-party repository into an image
 # that executes model-authored commands. Upstream release tarball, pinned by version and checked
 # against the sha256 the release publishes (gh_<version>_checksums.txt). The upstream binary is
-# dynamically linked against glibc only, which ubi-minimal carries; the `gh --version` at the end
-# of the RUN fails the build closed if that ever stops being true.
+# a static, CGO-free Go build, so it needs nothing from ubi-minimal's libc; the `gh --version`
+# at the end of the RUN still fails the build closed if a release ever ships a binary that does
+# not run on the built arch.
 #
 # To bump: change GH_VERSION and BOTH digests together, taking the new values from the release's
 # checksums file. Arch comes from `uname -m` for the same reason as the rg stage.
