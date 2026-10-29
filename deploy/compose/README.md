@@ -45,7 +45,12 @@ curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/deploy/compose/i
      `openssl`, but it does need the `docker` CLI. They reach `.env` through stdout, never a command
      line. A re-run adds any that are missing and never replaces one. Without a client ID, none of
      this runs.
-3. runs `docker compose up -d` in that directory.
+3. pulls the images (`docker compose pull`). `up -d` on its own pulls only when _no_ local image
+   matches, so a `:latest` this machine already has — from a run weeks ago — would never be
+   re-resolved and the stack would silently come up on it (#349). The pull is fail-closed: if it
+   cannot reach the registry, nothing is started. `SH_SKIP_PULL=1` runs the local images instead,
+   for an offline host or an `SH_HARNESS_IMAGE` you built yourself.
+4. runs `docker compose up -d` in that directory.
 
 The token isn't prompted for, because under `curl | sh` the script _is_ stdin. Set
 `SH_RELAY_TOKEN` in the environment to choose your own.
@@ -123,7 +128,7 @@ Only the addressing changes: `REDIS_URL=redis://redis:6379` and
 | `SH_REQUIRE_AUTH`                      | `false`                                          | `true` makes every supervisor turn need a control-plane session token, which turns plain `curl /turn` off.                                                                                                                                                                                                                             |
 | `SH_ALLOW_OPERATOR_FALLBACK`           | unset (off)                                      | Exactly `true`, with `SH_OPERATOR_INFERENCE_TOKEN` and `SH_DEFAULT_INFERENCE_ENDPOINT` (and `SH_OPERATOR_INFERENCE_HEADER=x-api-key` for an Anthropic API key), lets a user with no inference credential of their own run on the operator's. The control plane refuses to boot on a combination that cannot work. See "Using mocactl". |
 | `SH_MODEL_CATALOG_HOSTS`               | unset                                            | Comma-separated hostnames the control plane may ask which models a credential reaches, beyond `api.anthropic.com` and `SH_DEFAULT_INFERENCE_ENDPOINT`'s host. A credential on any other gateway lists no models; its model ids are accepted unverified. See [configuration](../../docs/reference/configuration.md).                    |
-| `SH_HARNESS_IMAGE`, `SH_SANDBOX_IMAGE` | `ghcr.io/rossoctl/moca{,-remote-worker}:latest`  | Published by `.github/workflows/build.yaml` on every push to `main`.                                                                                                                                                                                                                                                                   |
+| `SH_HARNESS_IMAGE`, `SH_SANDBOX_IMAGE` | `ghcr.io/rossoctl/moca{,-remote-worker}:latest`  | Published by `.github/workflows/build.yaml` on every push to `main`. Mutable tags, so `install.sh` pulls on every run (see "Try it"); set `SH_SKIP_PULL=1` to run a local build of either.                                                                                                                                             |
 | model variables                        | unset                                            | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `SH_MODEL`, `SH_MODEL_PROVIDER`, `SH_MODEL_API`, `SH_MODEL_BASE_URL`, `SH_MODEL_AUTH`, `SH_MODEL_CUSTOM`. An unset one stays unset in the container, not empty.                                                                |
 
 After editing `.env`, run `docker compose up -d` again to apply it.
@@ -198,7 +203,8 @@ even with `SH_REQUIRE_AUTH=false`, which is why the two tiers' keys must come fr
 
 Re-run `install.sh` (the same `curl … | sh` line). It fetches the current `docker-compose.yml`,
 keeps your `.env`, adds any credential the current stack requires (`MOCA_RELAY_EXEC_TOKEN`, and the
-control plane's four secrets once it is enabled) and then runs `docker compose up -d`. A bare `docker compose pull && docker compose up -d` in an existing
+control plane's four secrets once it is enabled), pulls the current images and then runs
+`docker compose up -d`. A bare `docker compose pull && docker compose up -d` in an existing
 directory runs the new images under the old compose file, which does not hand the relay
 `MOCA_RELAY_EXEC_TOKEN`, and the relay refuses to boot without it.
 
@@ -223,7 +229,9 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
   image and offline, never in argv, never replaced on a re-run, refused as half a keypair or as
   garbled generator output. It checks that `SH_GITHUB_CLIENT_ID` turns the profile on, that an
   operator's own `COMPOSE_PROFILES` is respected, and that a `docker-compose`-only machine still
-  installs without a control plane.
+  installs without a control plane. It also pins the pull (#349): that it runs from the project
+  directory before both `up -d` and the key generator, that a failed one starts nothing, and that
+  `SH_SKIP_PULL` skips it and still comes up.
 - `tests/compose.test.sh`: renders the compose file through `docker compose config` (no daemon
   needed) and asserts on the resolved result: a single worker-pool owner, env parity with
   `deploy/vm/env`, one port source, required inputs, and what gets published. It also checks the
