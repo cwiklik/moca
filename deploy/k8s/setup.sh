@@ -998,9 +998,14 @@ route_hosts() {
 }
 
 # The client id as resolved by write_settings (sticky: the earlier run's value when
-# SH_GITHUB_CLIENT_ID is unset). write_overlay and wait_ready decide replicas from this, never from
-# the raw environment, so a re-run without the variable keeps the control plane running.
+# SH_GITHUB_CLIENT_ID is unset -- except for CI_CLIENT_ID, which is derived per target rather than
+# inherited). write_overlay and wait_ready decide replicas from this, never from the raw
+# environment, so a re-run without the variable keeps the control plane running.
 CLIENT_ID=''
+# kind-ci's stand-in for a real GitHub App: derived by write_settings on that target, and discarded
+# when read back on any other one. kind and kind-ci share one cluster, hence one moca-settings, so a
+# stored copy of this is a CI leftover and never an operator's id (#429).
+CI_CLIENT_ID='Iv1.k8s-smoke-unused'
 client_id() { printf '%s' "$CLIENT_ID"; }
 
 # Memoised across the write_settings + print_access callers so the stored-URL lookup only
@@ -1065,10 +1070,19 @@ hand_patched_catalog_hosts() {
 write_settings() {
   local before after admins fb api_ttl session_ttl catalog_hosts catalog_src url
   before="$(configmap_json moca-settings)"
-  if [[ -n "${SH_GITHUB_CLIENT_ID+x}" ]]; then CLIENT_ID="$SH_GITHUB_CLIENT_ID"; else CLIENT_ID="$(cm_value "$before" SH_GITHUB_CLIENT_ID)"; fi
+  if [[ -n "${SH_GITHUB_CLIENT_ID+x}" ]]; then
+    CLIENT_ID="$SH_GITHUB_CLIENT_ID"
+  else
+    CLIENT_ID="$(cm_value "$before" SH_GITHUB_CLIENT_ID)"
+    # A stored CI_CLIENT_ID is not an operator's id: kind and kind-ci share one moca-settings, so an
+    # earlier kind-ci run leaves it behind, and inheriting it would render the control plane at 1
+    # replica with an id nobody can log in with, instead of 0 and write_overlay's warning (#429).
+    # Dropped here, then re-derived (same string, so the hash does not move) on kind-ci itself.
+    if [[ "$CLIENT_ID" == "$CI_CLIENT_ID" && "$TARGET" != kind-ci ]]; then CLIENT_ID=''; fi
+  fi
   if [[ -z "$CLIENT_ID" && "$TARGET" == kind-ci ]]; then
     # The CI smoke mints its own API tokens; no login ever runs, but the control plane needs a value.
-    CLIENT_ID='Iv1.k8s-smoke-unused'
+    CLIENT_ID="$CI_CLIENT_ID"
   fi
   if [[ -n "${SH_ADMIN_SUBJECTS+x}" ]]; then admins="$SH_ADMIN_SUBJECTS"; else admins="$(cm_value "$before" SH_ADMIN_SUBJECTS)"; fi
   if [[ -n "${SH_ALLOW_OPERATOR_FALLBACK+x}" ]]; then fb="$SH_ALLOW_OPERATOR_FALLBACK"; else fb="$(cm_value "$before" SH_ALLOW_OPERATOR_FALLBACK)"; fi
