@@ -145,6 +145,42 @@ jobs:
           }
           bash deploy/knative/verify-sandbox-inventory.sh "$IMAGE"
 
+  # The same deploy/ suites, on bash 3.2 (#440). deploy-scripts above runs them on the runner's
+  # bash 5; macOS ships 3.2.57 as /bin/bash, which is what an operator runs deploy/k8s/setup.sh
+  # with. That version gap is not theoretical: slice 2 (#424) shipped `"${arr[@]}"` on an empty
+  # array under `set -u`, which breaks every 3.2 run, and nothing in CI could see it -- it was
+  # caught in review. This job is the thing that sees it.
+  #
+  # Three suites, not `make test-deploy`: four of the other suites use bash 4 constructs by
+  # design. The list lives in the Makefile target, so it cannot drift from what contributors
+  # reproduce locally with one command.
+  deploy-scripts-bash32:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The target skips when /bin/bash is not 3.x, so without this check an Apple bump would
+      # turn this job into a green no-op that reads as coverage. Fail loudly instead.
+      - name: Confirm /bin/bash is 3.x
+        run: |
+          v="$(/bin/bash --version | head -1)"
+          echo "$v"
+          case "$v" in
+          *"version 3."*) ;;
+          *) echo "::error title=/bin/bash is no longer 3.x::$v -- this job no longer tests bash 3.2. The runner image changed or macOS shipped a newer bash; re-point the job, or drop it and say why on #440."; exit 1 ;;
+          esac
+
+      # deploy/microvm/tests/setup-microvm.test.sh guards its `shellcheck "$SCRIPT"` with
+      # `command -v shellcheck`, so without this the check silently skips and asserts nothing.
+      # jq is already on the runner image, and the suites pass against the stock LibreSSL at
+      # /usr/bin/openssl, so neither of those needs installing.
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Run the 3.2-safe deploy shell tests on /bin/bash
+        run: make test-deploy-bash32
+
   # Spec §8's correctness gates for the microVM tier, and an explicit statement of the half
   # of them this runner cannot exercise. Six of them need /dev/kvm AND a golden snapshot
   # built by deploy/microvm/build-snapshot.sh -- a standard runner has neither, and the

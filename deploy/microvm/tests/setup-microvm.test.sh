@@ -15,6 +15,10 @@ set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$DIR/setup-microvm.sh"
+# The bash that launched this suite, not the first one on PATH (#440), as in
+# deploy/k8s/tests/setup.test.sh: `/bin/bash setup-microvm.test.sh` on macOS must exercise bash
+# 3.2. $BASH is the running interpreter's own path; the fallback is for a sourced run.
+REAL_BASH="${BASH:-$(command -v bash)}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 fails=0
@@ -106,6 +110,14 @@ MOCK
 real_awk="$(command -v awk)"
 # shellcheck disable=SC2016 # $* and $MOCK_LOG are for the mock to expand, not this shell
 printf '#!/bin/sh\nprintf "awk %%s\\n" "$*" >>"$MOCK_LOG"\nexec %s "$@"\n' "$real_awk" >"$TMP/bin/awk"
+# The bash mocks above are heredocs with `#!/usr/bin/env bash`, which resolves against the PATH
+# below -- $TMP/bin first, then the caller's, so it would find Homebrew's 5.x even when this suite
+# was launched with /bin/bash. Pin them to $REAL_BASH so the mocks run on the same interpreter as
+# the script under test (#440). The awk shim needs no pin: it is sh and execs an absolute binary.
+for m in podman systemctl id go journalctl; do
+  { printf '#!%s\n' "$REAL_BASH"; tail -n +2 "$TMP/bin/$m"; } >"$TMP/bin/$m.new"
+  mv "$TMP/bin/$m.new" "$TMP/bin/$m"
+done
 chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH"
 
@@ -126,7 +138,7 @@ python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' 
 export SH_UNIT_DIR="$TMP/units" SH_ENV_DIR="$TMP/etc" SH_BIN_DIR="$TMP/usrbin" \
   MICROVM_SNAPSHOT_DIR="$TMP/snap" MICROVM_ATTACH_TIMEOUT=1 MICROVM_ATTACH_SETTLE=1 \
   MOCA_EGRESS_SOCKET="$EGRESS_SOCK" MOCA_EGRESS_READY_TIMEOUT=2
-run() { bash "$SCRIPT" >"$TMP/run.log" 2>&1; echo $?; }
+run() { "$REAL_BASH" "$SCRIPT" >"$TMP/run.log" 2>&1; echo $?; }
 val() { grep -E "^$1=" "$2" | tail -1 | cut -d= -f2-; }
 hash_tree() { (cd "$TMP" && find units etc usrbin -type f -exec cksum {} + | sort); }
 
@@ -295,7 +307,7 @@ check "the refusal names the reserve it must exceed" "$(grep -c 'MICROVM_MAX_COM
 echo "== MICROVM_ATTACH_TIMEOUT / MICROVM_ATTACH_SETTLE: whole seconds, the settle at least 1"
 for bad in SETTLE=0 SETTLE=x TIMEOUT=x; do
   reset_host
-  check "MICROVM_ATTACH_$bad refused" "$(env "MICROVM_ATTACH_$bad" bash "$SCRIPT" >"$TMP/run.log" 2>&1; echo $?)" "1"
+  check "MICROVM_ATTACH_$bad refused" "$(env "MICROVM_ATTACH_$bad" "$REAL_BASH" "$SCRIPT" >"$TMP/run.log" 2>&1; echo $?)" "1"
   check "MICROVM_ATTACH_$bad: nothing written" "$(find "$TMP/etc" "$TMP/units" -name '*microvm*' | wc -l | tr -d ' ')" "0"
   check "MICROVM_ATTACH_$bad: the refusal names the variable" "$(grep -c "MICROVM_ATTACH_${bad%%=*}='${bad#*=}' must be" "$TMP/run.log")" "1"
 done
@@ -468,7 +480,7 @@ reset_remote_host() { # no P6 at all: just a snapshot
   reset_host
   rm -f "$TMP/etc/relay.env" "$TMP/units/"sh-*.service
 }
-runr() { bash "$SCRIPT" --remote "$1" >"$TMP/run.log" 2>&1; echo $?; }
+runr() { "$REAL_BASH" "$SCRIPT" --remote "$1" >"$TMP/run.log" 2>&1; echo $?; }
 B="$TMP/bundle"; CA="$TMP/etc/microvm-relay-ca.crt"; RD="$TMP/units/microvm-worker.service.d/50-moca-remote.conf"
 W="$TMP/etc/microvm-worker.env"; R="$TMP/etc/microvm-relay.env"
 
@@ -546,7 +558,7 @@ for case in no-env no-port tls-false dashed-id short-token bad-ca no-value; do
     bad-ca) printf 'not a certificate\n' >"$B/relay-ca.crt" ;;
     no-value) arg='' ;;
   esac
-  if [[ -n "$arg" ]]; then got="$(runr "$arg")"; else got="$(bash "$SCRIPT" --remote >"$TMP/run.log" 2>&1; echo $?)"; fi
+  if [[ -n "$arg" ]]; then got="$(runr "$arg")"; else got="$("$REAL_BASH" "$SCRIPT" --remote >"$TMP/run.log" 2>&1; echo $?)"; fi
   check "$case: exit 1" "$got" "1"
   check "$case: no microvm env files" "$(find "$TMP/etc" -name '*microvm*' | wc -l | tr -d ' ')" "0"
   check "$case: no systemctl" "$(grep -c '^systemctl' "$MOCK_LOG")" "0"
