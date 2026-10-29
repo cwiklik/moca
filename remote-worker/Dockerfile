@@ -74,6 +74,41 @@ RUN set -eux; \
     rm -rf "/tmp/${tarball}" /tmp/rg.sha256 "/tmp/ripgrep-${RG_VERSION}-${target}"; \
     /usr/local/bin/rg --version
 
+# gh (the GitHub CLI) is vendored for the same reason as rg: docs/sbx/user-guide.md promises `gh`
+# works in a sandbox (`gh pr create` under the sbx credentials feature), it is not in the UBI 9
+# repositories, and adding GitHub's own dnf repo would put a third-party repository into an image
+# that executes model-authored commands. Upstream release tarball, pinned by version and checked
+# against the sha256 the release publishes (gh_<version>_checksums.txt). The upstream binary is
+# a static, CGO-free Go build, so it needs nothing from ubi-minimal's libc; the `gh --version`
+# at the end of the RUN still fails the build closed if a release ever ships a binary that does
+# not run on the built arch.
+#
+# To bump: change GH_VERSION and BOTH digests together, taking the new values from the release's
+# checksums file. Arch comes from `uname -m` for the same reason as the rg stage.
+# hadolint ignore=DL3007
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS gh
+ARG GH_VERSION=2.103.3
+ARG GH_SHA256_X86_64=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+ARG GH_SHA256_AARCH64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63
+# hadolint ignore=DL3041
+RUN microdnf install -y --nodocs tar gzip \
+    && microdnf clean all
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)  distro=linux_amd64;  sha="$GH_SHA256_X86_64" ;; \
+      aarch64) distro=linux_arm64;  sha="$GH_SHA256_AARCH64" ;; \
+      *) echo "no pinned gh build for $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    tarball="gh_${GH_VERSION}_${distro}.tar.gz"; \
+    curl -fsSL -o "/tmp/${tarball}" \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${tarball}"; \
+    printf '%s  %s\n' "${sha}" "/tmp/${tarball}" > /tmp/gh.sha256; \
+    sha256sum -c /tmp/gh.sha256; \
+    tar -xzf "/tmp/${tarball}" -C /tmp; \
+    install -m 755 "/tmp/gh_${GH_VERSION}_${distro}/bin/gh" /usr/local/bin/gh; \
+    rm -rf "/tmp/${tarball}" /tmp/gh.sha256 "/tmp/gh_${GH_VERSION}_${distro}"; \
+    /usr/local/bin/gh --version
+
 # The worker execs `bash -c <command>`, so the runtime image needs a shell and the
 # coreutils the harness's ops call: base64 (writeFile), file (image mime sniffing).
 # distroless/static ships none of them — every exec would fail with ENOENT.
@@ -85,12 +120,12 @@ RUN set -eux; \
 # bumps for the same reason .hadolint.yaml already ignores DL3018 for Alpine.
 # hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
-# git and python3 are here because cmd/worker/main.go's `probed` list advertises
-#   bash, rg, base64, file, python3, git
+# git, python3 and gh are here because cmd/worker/main.go's `probed` list advertises
+#   bash, rg, base64, file, python3, git, gh
 # as this worker's Hello.capabilities, and its comment says "the pool will eventually match on
-# these, so they must be true". Three of the six were not: on a real VM the leaf reported
-# `caps=[bash base64 file]`, so it advertised a set it could not honour. All six are now installed
-# (`rg` from the stage above), and dockerfile_parity_test.go fails if that stops being true.
+# these, so they must be true". Three of the original six were not: on a real VM the leaf reported
+# `caps=[bash base64 file]`, so it advertised a set it could not honour. All seven are now installed
+# (`rg` and `gh` from the stages above), and dockerfile_parity_test.go fails if that stops being true.
 #
 # git also matters for measurement. Spec §2.3's duty bases were derived from workloads whose git
 # operations cost ~470ms; without git in the sandbox, an E8 tool call can only be a ~0ms no-op, so
@@ -114,6 +149,7 @@ RUN microdnf install -y --nodocs bash coreutils-single findutils file git python
     && microdnf clean all
 COPY --from=build /out/remote-worker /usr/local/bin/remote-worker
 COPY --from=rg /usr/local/bin/rg /usr/local/bin/rg
+COPY --from=gh /usr/local/bin/gh /usr/local/bin/gh
 # The harness execs every tool call from its sandbox working directory, which defaults to
 # /workspace (KAGENTI_SANDBOX_CWD, select-sandbox.ts). Without this directory the worker's
 # `bash -c` fails before running anything the caller asked for:

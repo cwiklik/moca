@@ -51,6 +51,7 @@ var provides = map[string]source{
 	"git":     {pkg: "git"},
 	"python3": {pkg: "python3"},
 	"rg":      {vendored: "ripgrep-${RG_VERSION}-${target}.tar.gz"},
+	"gh":      {vendored: "gh_${GH_VERSION}_${distro}.tar.gz"},
 }
 
 // knownGap is for a probed tool deliberately left out of the images. It must stay EMPTY unless the
@@ -266,6 +267,27 @@ func TestVendoredRipgrepIsPinnedAndChecksummed(t *testing.T) {
 				t.Errorf("%s: vendored ripgrep is missing %q. Without it the build would accept "+
 					"whatever bytes the network returned for a binary that then executes "+
 					"model-authored commands.", name, want)
+			}
+		}
+	}
+}
+
+// Same contract as TestVendoredRipgrepIsPinnedAndChecksummed for the vendored gh: the sbx
+// credentials feature hands `gh` the user's GitHub PAT's identity, so a tampered download would
+// be executing model-authored commands AS the user.
+func TestVendoredGhIsPinnedAndChecksummed(t *testing.T) {
+	for name, body := range dockerfiles(t) {
+		body := code(body)
+		for _, want := range []string{
+			"ARG GH_VERSION=",
+			"ARG GH_SHA256_X86_64=",
+			"ARG GH_SHA256_AARCH64=",
+			"sha256sum -c /tmp/gh.sha256",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s: vendored gh is missing %q. Without it the build would accept "+
+					"whatever bytes the network returned for a binary that runs as the sandbox's "+
+					"user against their GitHub account.", name, want)
 			}
 		}
 	}

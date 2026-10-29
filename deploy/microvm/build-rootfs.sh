@@ -3,7 +3,7 @@
 #
 # Turns the P6 sandbox IMAGE's filesystem into a directory tree for
 # `build-snapshot.sh --rootfs`, so a microVM built from it carries the same toolchain the
-# container tier does (bash, coreutils, findutils, file, git, python3, rg -- see
+# container tier does (bash, coreutils, findutils, file, git, python3, rg, gh -- see
 # remote-worker/Dockerfile). It only READS the image: `podman create` + `podman export`, then
 # the temporary container is removed. build-snapshot.sh layers the guest agent and its init
 # on top; nothing here adds either.
@@ -22,7 +22,7 @@ OUT=""
 # The container tier's Hello.capabilities (cmd/worker's `probed`) plus the two coreutils the
 # harness's own file ops call. A tree missing one of these would boot, snapshot, advertise less,
 # and then fail the first tool call that needs it -- so refuse here instead.
-REQUIRED_TOOLS=(bash git rg python3 base64 file ls cat)
+REQUIRED_TOOLS=(bash git rg gh python3 base64 file ls cat)
 
 usage() {
   echo "usage: $0 --out DIR [--image REF]   (default image: $IMAGE)" >&2
