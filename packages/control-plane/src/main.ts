@@ -289,12 +289,16 @@ export function checkInferenceConfig(c: CpConfig): void {
         'no endpoint of its own',
     );
   }
-  // An Anthropic OAuth token is a working fallback shape, but only on Bearer and only to
-  // api.anthropic.com (#595); the header check is direct-mode, so placeholder mode skips it below.
-  if (token.startsWith('sk-ant-oat') && c.operatorInferenceHeader === 'x-api-key') {
+  // A caller's OWN sk-ant-oat credential is a working shape (#595), but the operator fallback is
+  // shared by every caller, and spending one person's Claude Pro/Max subscription on all of them
+  // is account sharing on a personal plan (PR #658 review). Refused in every mode, including
+  // placeholder, because this is policy rather than a wire-shape check.
+  if (token.startsWith('sk-ant-oat')) {
     throw new Error(
-      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), which is read from ' +
-        'Authorization: Bearer: unset SH_OPERATOR_INFERENCE_HEADER',
+      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), which cannot be the ' +
+        'shared operator fallback: one subscription must not serve every caller. Use a gateway ' +
+        'token or an Anthropic API key (sk-ant-api…); callers may store their own OAuth token as ' +
+        'an inference credential',
     );
   }
   // Placeholder mode: the injector, not the harness, picks the upstream header (exchange.ts).

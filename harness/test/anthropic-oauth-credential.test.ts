@@ -1,9 +1,23 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { complete, getModel } from '@earendil-works/pi-ai';
-import { ModelRegistry } from '@earendil-works/pi-coding-agent';
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  ModelRegistry,
+  SessionManager,
+  type FileEntry,
+} from '@earendil-works/pi-coding-agent';
 import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { applyModelGateway, oauthAuthStorage } from '../src/run-turn';
+import { RedisSessionBackend } from '@moca/session-backend';
+import { BufferedRedisBackend } from '../src/buffered-redis-backend';
+import { AMBIENT_KEY_SENTINEL } from '../src/ambient-sentinel';
+import {
+  applyModelGateway,
+  oauthAuthStorage,
+  turnLoaderInputs,
+  type TurnConfig,
+} from '../src/run-turn';
 
 /**
  * A caller credential that is an Anthropic OAuth token (#595): the harness must hand it to pi as
@@ -116,4 +130,87 @@ describe('an Anthropic OAuth token on the wire', () => {
     // Claude Code identity betas) when its resolved key is the token.
     expect(String(seen!['anthropic-beta'])).toContain('oauth-2025-04-20');
   });
+});
+
+describe('an Anthropic OAuth token through createAgentSession (PR #658 review)', () => {
+  // The link the wiring depends on: the runtime override must put the caller's token ahead of the
+  // ANTHROPIC_API_KEY sentinel that applyModelGateway seeds, INSIDE the session pi builds — not
+  // just in a hand-resolved ModelRegistry. Drives a real session against a local stand-in.
+  const REDIS = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
+  let server: Server;
+  let seen: IncomingHttpHeaders | undefined;
+  let baseUrl: string;
+  let savedKey: string | undefined;
+
+  beforeEach(async () => {
+    savedKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    seen = undefined;
+    server = createServer((req, res) => {
+      seen = req.headers;
+      req.resume();
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: 'invalid oauth token' },
+        }),
+      );
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = savedKey;
+  });
+
+  it('reaches the wire as Bearer + oauth beta despite the env sentinel', async () => {
+    const config: TurnConfig = {
+      serverMode: true,
+      anthropicBaseUrl: baseUrl,
+      upstreamCredential: { mode: 'direct', value: OAT },
+    };
+    // Exactly executeTurnCore's sequence: gateway transform, then the per-session auth storage.
+    const model = applyModelGateway(getModel('anthropic', 'claude-haiku-4-5'), config);
+    expect(process.env.ANTHROPIC_API_KEY).toBe(AMBIENT_KEY_SENTINEL);
+    const authStorage = oauthAuthStorage(model, config);
+    expect(authStorage).toBeDefined();
+
+    const store = new RedisSessionBackend<FileEntry>(REDIS);
+    const backend = new BufferedRedisBackend(store);
+    const sid = `oauth-wire-${Date.now()}`;
+    try {
+      const sessionManager = SessionManager.create(process.cwd(), undefined, { id: sid }, backend);
+      const { settingsManager, loaderOptions } = turnLoaderInputs({
+        config,
+        cwd: process.cwd(),
+        extensionFactories: [],
+      });
+      const resourceLoader = new DefaultResourceLoader(loaderOptions as never);
+      await resourceLoader.reload();
+      const { session } = await createAgentSession({
+        sessionManager,
+        model,
+        resourceLoader,
+        settingsManager,
+        authStorage: authStorage!,
+      });
+
+      // The 401 ends the turn as an error message; the headers are what is under test.
+      await session.prompt('hi');
+      await backend.flush();
+
+      expect(seen).toBeDefined();
+      expect(seen!.authorization).toBe(`Bearer ${OAT}`);
+      // The sentinel must not win: pi resolved the caller's token from the override, so no x-api-key.
+      expect(seen!['x-api-key']).toBeUndefined();
+      expect(String(seen!['anthropic-beta'])).toContain('oauth-2025-04-20');
+    } finally {
+      await store.reset(sid).catch(() => {});
+      await store.close();
+    }
+  }, 30000);
 });

@@ -39,7 +39,7 @@ describe('SH_OPERATOR_INFERENCE_HEADER', () => {
 });
 
 describe('checkInferenceConfig at boot', () => {
-  it('boots a fallback that can work: a gateway token on Bearer, a raw key on x-api-key, an OAuth token on Bearer to api.anthropic.com (#595)', () => {
+  it('boots a fallback that can work: a gateway token on Bearer, a raw key on x-api-key', () => {
     expect(
       bootError({
         SH_ALLOW_OPERATOR_FALLBACK: 'true',
@@ -52,13 +52,6 @@ describe('checkInferenceConfig at boot', () => {
         SH_ALLOW_OPERATOR_FALLBACK: 'true',
         SH_OPERATOR_INFERENCE_TOKEN: RAW_KEY,
         SH_OPERATOR_INFERENCE_HEADER: 'x-api-key',
-        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
-      }),
-    ).toBe('<booted>');
-    expect(
-      bootError({
-        SH_ALLOW_OPERATOR_FALLBACK: 'true',
-        SH_OPERATOR_INFERENCE_TOKEN: 'sk-ant-oat01-not-real', // notsecret
         SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
       }),
     ).toBe('<booted>');
@@ -107,29 +100,37 @@ describe('checkInferenceConfig at boot', () => {
     expect(m).not.toContain(RAW_KEY);
   });
 
-  it('refuses an Anthropic OAuth operator key on the x-api-key header', () => {
+  it('refuses an Anthropic OAuth token as the operator key: the fallback is shared by every caller', () => {
+    // PR #658 review: an sk-ant-oat operator fallback would spend one person's Claude Pro/Max
+    // subscription on every caller without their own credential — account sharing on a personal
+    // plan. A caller's OWN OAuth credential is fine (exchange-auth-header.test.ts); the shared
+    // fallback is not, whatever the header or endpoint.
     const oat = 'sk-ant-oat01-not-real'; // notsecret
-    const m = bootError({
-      SH_ALLOW_OPERATOR_FALLBACK: 'true',
-      SH_OPERATOR_INFERENCE_TOKEN: oat,
-      SH_OPERATOR_INFERENCE_HEADER: 'x-api-key',
-      SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
-    });
-    expect(m).toContain('sk-ant-oat');
-    expect(m).toContain('SH_OPERATOR_INFERENCE_HEADER');
-    expect(m).not.toContain(oat);
-  });
-
-  it('refuses an Anthropic OAuth operator key aimed at a gateway', () => {
-    const oat = 'sk-ant-oat01-not-real'; // notsecret
-    const m = bootError({
-      SH_ALLOW_OPERATOR_FALLBACK: 'true',
-      SH_OPERATOR_INFERENCE_TOKEN: oat,
-      SH_DEFAULT_INFERENCE_ENDPOINT: 'https://litellm.internal',
-    });
-    expect(m).toContain('sk-ant-oat');
-    expect(m).toContain('https://api.anthropic.com');
-    expect(m).not.toContain(oat);
+    for (const env of [
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
+      },
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_OPERATOR_INFERENCE_HEADER: 'x-api-key',
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
+      },
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://litellm.internal',
+      },
+      // Placeholder mode too: the refusal is policy, not a wire-shape check.
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
+        SH_INJECTOR_CONFIGURED: 'true',
+      },
+    ]) {
+      const m = bootError({ SH_ALLOW_OPERATOR_FALLBACK: 'true', ...env });
+      expect(m, JSON.stringify(env)).toContain('sk-ant-oat');
+      expect(m, JSON.stringify(env)).not.toContain(oat);
+    }
   });
 
   it('skips the header check in placeholder mode, where the injector picks the upstream header', () => {
