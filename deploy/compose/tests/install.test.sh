@@ -53,6 +53,7 @@ MOCK
 
 # docker: records argv and the working directory (compose reads .env from the project dir).
 # MOCK_NO_COMPOSE_PLUGIN=1 makes `docker compose` behave like a docker without the v2 plugin.
+# MOCK_PULL_FAIL=1 makes `compose pull` fail, as an offline host or a private registry does.
 # `docker run ... genkeys.ts` stands in for the control plane's key generator: fresh random values in
 # genkeys.ts's output shapes (control-plane/test/main.test.ts pins those against the real code), or
 # a garbled line under MOCK_GENKEYS_BAD=1.
@@ -61,6 +62,10 @@ cat >"$TMP/bin/docker" <<'MOCK'
 printf 'docker %s [cwd=%s]\n' "$*" "$PWD" >>"$MOCK_LOG"
 if [ "${1-}" = compose ] && [ -n "${MOCK_NO_COMPOSE_PLUGIN-}" ]; then
   echo "docker: 'compose' is not a docker command." >&2
+  exit 1
+fi
+if [ "${1-}" = compose ] && [ "${2-}" = pull ] && [ -n "${MOCK_PULL_FAIL-}" ]; then
+  echo "mock: Error response from daemon: unauthorized" >&2
   exit 1
 fi
 if [ "${1-}" = run ]; then
@@ -95,8 +100,8 @@ tail() { PATH=/usr/bin:/bin command tail "$@"; }
 cut() { PATH=/usr/bin:/bin command cut "$@"; }
 # A developer's own shell may carry these; the script must not pick them up by accident.
 unset SH_RELAY_TOKEN SH_TURNS_PER_WORKER ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
-  OPENAI_API_KEY SH_MODEL MOCK_NO_COMPOSE_PLUGIN MOCK_GENKEYS_BAD SH_GITHUB_CLIENT_ID SH_HARNESS_IMAGE \
-  COMPOSE_PROFILES 2>/dev/null || true
+  OPENAI_API_KEY SH_MODEL MOCK_NO_COMPOSE_PLUGIN MOCK_GENKEYS_BAD MOCK_PULL_FAIL SH_GITHUB_CLIENT_ID \
+  SH_HARNESS_IMAGE SH_SKIP_PULL COMPOSE_PROFILES 2>/dev/null || true
 export SH_COMPOSE_BASE_URL="https://example.invalid/deploy/compose"
 
 # Runs install.sh exactly as the README's one-liner does: the script body on sh's stdin, so
@@ -119,6 +124,10 @@ assert_not_in_argv() {
 
 env_value() { grep -E "^$1=" "$2" | tail -1 | cut -d= -f2-; }
 
+# The line number of the first logged argv matching the ERE, or empty. The mock log is append-only
+# and single-process, so comparing two of these compares the order the commands actually ran in.
+log_line_of() { grep -nE "$1" "$MOCK_LOG" | head -1 | cut -d: -f1; }
+
 mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
 # --- 1. fresh install with an operator-supplied token ------------------------------------------
@@ -138,6 +147,19 @@ assert_not_in_argv 's3cr3t-operator-value'
 grep -qE "^docker compose up -d \[cwd=$SH_COMPOSE_DIR\]$" "$MOCK_LOG" ||
   fail "expected 'docker compose up -d' run from $SH_COMPOSE_DIR: $(grep '^docker' "$MOCK_LOG")"
 pass "fresh install: fetches the compose file, writes a 0600 .env, runs up -d, token never in argv"
+
+# #349: `up -d` reuses a cached :latest without ever re-resolving it, so a machine that pulled the
+# image once runs that one forever -- and both defaults are mutable tags build.yaml republishes on
+# every push to main. The pull must happen, from the project directory (so .env's SH_HARNESS_IMAGE
+# and SH_SANDBOX_IMAGE are the references pulled), and BEFORE up -d, which is the whole point.
+grep -qE "^docker compose pull \[cwd=$SH_COMPOSE_DIR\]$" "$MOCK_LOG" ||
+  fail "install.sh did not pull before starting the stack, so a stale cached :latest runs (#349):" \
+    "$(grep '^docker' "$MOCK_LOG")"
+pull_at="$(log_line_of '^docker compose pull ')"
+up_at="$(log_line_of '^docker compose up -d ')"
+[[ -n "$pull_at" && -n "$up_at" && "$pull_at" -lt "$up_at" ]] ||
+  fail "the pull must run before up -d (pull at line '$pull_at', up at '$up_at')"
+pass "fresh install pulls the images from the project directory, before up -d (#349)"
 
 # The supervisor's readConfig refuses to start with SH_TURNS_PER_WORKER blank, and the compose
 # file makes it required, so a trial install that leaves it unset never gets a supervisor.
@@ -195,7 +217,11 @@ SH_RELAY_TOKEN='a-different-value' run_install || fail "re-run exited non-zero"
 [[ "$(env_value SH_RELAY_TOKEN "$SH_COMPOSE_DIR/.env")" == "$GEN_A" ]] ||
   fail "re-run replaced the existing SH_RELAY_TOKEN; running sandboxes would stop authenticating"
 grep -q '^docker compose up -d' "$MOCK_LOG" || fail "re-run did not bring the stack up"
-pass "re-run keeps an existing .env untouched and still runs up -d"
+# The re-run IS the #349 case: this directory's images were pulled on the first install, so without
+# a pull here the "upgrade" path in README.md ("Re-run install.sh") never gets the current main.
+grep -q '^docker compose pull' "$MOCK_LOG" ||
+  fail "a re-run did not pull, so the documented upgrade path keeps running the cached images (#349)"
+pass "re-run keeps an existing .env untouched, pulls, and still runs up -d"
 
 # --- 4. an existing .env with no token fails closed, before any container starts ----------------
 export SH_COMPOSE_DIR="$TMP/four"
@@ -225,7 +251,11 @@ export SH_COMPOSE_DIR="$TMP/six"
 MOCK_NO_COMPOSE_PLUGIN=1 run_install || fail "install with only docker-compose exited non-zero"
 grep -qE "^docker-compose up -d \[cwd=$SH_COMPOSE_DIR\]$" "$MOCK_LOG" ||
   fail "expected the docker-compose fallback: $(grep -E '^docker' "$MOCK_LOG")"
-pass "without the compose plugin, falls back to docker-compose"
+# The pull goes through the same entrypoint: `docker compose pull` on a machine without the v2
+# plugin is the error detect_compose exists to avoid, and would abort the install.
+grep -qE "^docker-compose pull \[cwd=$SH_COMPOSE_DIR\]$" "$MOCK_LOG" ||
+  fail "the pull did not use the docker-compose fallback: $(grep -E '^docker' "$MOCK_LOG")"
+pass "without the compose plugin, both the pull and up -d fall back to docker-compose"
 
 # --- 7. no docker at all: a clear refusal, nothing written ---------------------------------------
 export SH_COMPOSE_DIR="$TMP/seven"
@@ -274,6 +304,11 @@ ENV8="$SH_COMPOSE_DIR/.env"
 for k in $MU1_KEYS; do assert_not_in_argv "$(env_value "$k" "$ENV8")"; done
 grep -qE '^docker run --rm --network none --user 1000:1000 -w /app/packages/control-plane ghcr\.io/rossoctl/moca:latest node --import tsx src/genkeys\.ts' \
   "$MOCK_LOG" || fail "the key generator must run offline in the harness image: $(grep '^docker run' "$MOCK_LOG")"
+# The generator is code from the harness image, so it has to run on the PULLED one (#349): a stale
+# image may ship a different genkeys.ts, or -- as in the issue -- not the package at all.
+genkeys_at="$(log_line_of '^docker run .*genkeys\.ts')"
+[[ -n "$genkeys_at" && "$(log_line_of '^docker compose pull ')" -lt "$genkeys_at" ]] ||
+  fail "the key generator ran before the pull, so it ran in a possibly stale image (#349)"
 pass "a fresh install generates the four MU1 secrets in the harness image, offline, never in argv"
 
 before="$(grep -E '^SH_(SESSION_TOKEN|CREDENTIAL_KEK|EXCHANGE_TOKEN)' "$ENV8")"
@@ -384,3 +419,35 @@ grep -q 'docker CLI' "$TMP/err" || fail "the refusal must say the docker CLI is 
 if grep -q ' up ' "$MOCK_LOG"; then fail "containers were started with no keys generated"; fi
 mv "$TMP/bin/docker.off" "$TMP/bin/docker"
 pass "docker-compose only: installs without a control plane, refuses one it cannot generate keys for"
+
+# --- 11. the pull is fail-closed, and SH_SKIP_PULL is the way past it (#349) ----------------------
+# A pull that fails leaves only the images this machine happens to hold, which is the bug the pull
+# exists to prevent -- and on a first install there is nothing to run at all. So it refuses, says
+# how to override, and starts nothing.
+export SH_COMPOSE_DIR="$TMP/eleven"
+if MOCK_PULL_FAIL=1 run_install 2>"$TMP/err"; then fail "install succeeded with a failing pull"; fi
+grep -q 'SH_SKIP_PULL' "$TMP/err" || fail "the refusal must name the override: $(cat "$TMP/err")"
+if grep -q ' up ' "$MOCK_LOG"; then fail "the stack was started after a failed pull: $(grep ' up ' "$MOCK_LOG")"; fi
+pass "a failed pull refuses, names SH_SKIP_PULL, and starts nothing"
+
+# Same failing registry, with the override: the stack comes up on the local images, and the pull is
+# not even attempted -- an offline host must not have to wait for one to time out.
+export SH_COMPOSE_DIR="$TMP/eleven-skip"
+MOCK_PULL_FAIL=1 SH_SKIP_PULL=1 run_install >"$TMP/out" || fail "SH_SKIP_PULL install exited non-zero"
+if grep -q '^docker compose pull' "$MOCK_LOG"; then fail "SH_SKIP_PULL still pulled: $(grep '^docker compose' "$MOCK_LOG")"; fi
+grep -qE "^docker compose up -d \[cwd=$SH_COMPOSE_DIR\]$" "$MOCK_LOG" ||
+  fail "SH_SKIP_PULL did not bring the stack up: $(grep '^docker' "$MOCK_LOG")"
+grep -q 'SH_SKIP_PULL' "$TMP/out" || fail "a skipped pull must be visible in the output: $(cat "$TMP/out")"
+pass "SH_SKIP_PULL skips the pull, says so, and still starts the stack"
+
+# The control plane's keys are generated inside the harness image, so a refused pull must stop
+# before that -- a stale image is exactly the case where the generator may be missing (#349).
+export SH_COMPOSE_DIR="$TMP/eleven-cp"
+if MOCK_PULL_FAIL=1 SH_GITHUB_CLIENT_ID=Iv1.fabricated run_install 2>"$TMP/err"; then
+  fail "install with a control plane succeeded with a failing pull"
+fi
+[[ "$(genkeys_runs)" == 0 ]] || fail "the key generator ran in an unpulled image after the pull failed"
+if grep -qE '^SH_(SESSION_TOKEN|CREDENTIAL_KEK|EXCHANGE_TOKEN)' "$SH_COMPOSE_DIR/.env"; then
+  fail "MU1 secrets were written after a failed pull"
+fi
+pass "a failed pull stops before the key generator, writing no MU1 secret"

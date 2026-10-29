@@ -1,7 +1,7 @@
 #!/bin/sh
 # Dev-machine trial bootstrap (#342): fetches deploy/compose/docker-compose.yml, writes a .env
 # next to it (generating SH_RELAY_TOKEN when none is supplied, and -- when SH_GITHUB_CLIENT_ID turns
-# the MU1 control plane on -- its secrets, #348) and runs `docker compose up -d`.
+# the MU1 control plane on -- its secrets, #348), pulls the images and runs `docker compose up -d`.
 #
 #   curl -fsSL https://raw.githubusercontent.com/rossoctl/moca/main/deploy/compose/install.sh | sh
 #
@@ -14,6 +14,7 @@
 #   SH_COMPOSE_DIR       Where the compose file and .env live (default $HOME/.serverless-harness)
 #   SH_COMPOSE_BASE_URL  Where to fetch docker-compose.yml from (default: this repo's main branch)
 #   SH_RELAY_TOKEN       The relay's shared secret; generated (32 random bytes, hex) if unset
+#   SH_SKIP_PULL         Non-empty: do not pull, run whatever images this machine already has
 #   SH_TURNS_PER_WORKER  Per-worker in-flight turn cap (default 4 -- a trial value, not an E8 result)
 #   SH_GITHUB_CLIENT_ID  A GitHub OAuth app's client id, device flow enabled: turns on the control
 #                        plane (the `control-plane` profile) that mocactl logs in through
@@ -255,6 +256,28 @@ published_port() {
   printf '%s' "${port:-$2}"
 }
 
+# `up -d` pulls an image only when NO local image matches the reference, so a :latest that is
+# already present -- pulled once, weeks ago -- is never re-resolved against the registry and the
+# stack silently comes up on it (#349). Both default images are mutable tags that build.yaml
+# republishes on every push to main, so pull explicitly, every run.
+#
+# A failed pull is fatal rather than a warning: running the images this machine happens to hold is
+# the bug, and on a first install there is nothing to fall back to. SH_SKIP_PULL is the way out for
+# an offline host or a locally built SH_HARNESS_IMAGE that no registry serves.
+#
+# In the project directory, so the references pulled are the ones .env interpolates (SH_HARNESS_IMAGE,
+# SH_SANDBOX_IMAGE) -- a subshell, because main cd's there itself for `up -d`.
+pull_images() {
+  if [ -n "${SH_SKIP_PULL:-}" ]; then
+    log "SH_SKIP_PULL is set: not pulling, the stack runs the images this machine already has"
+    return 0
+  fi
+  log "pulling the images ($COMPOSE pull)"
+  (cd "$SH_COMPOSE_DIR" && $COMPOSE pull) ||
+    die "could not pull the images. Re-run with SH_SKIP_PULL=1 to start the stack on the images" \
+      "this machine already has -- they may be stale, which is its own failure mode (#349)."
+}
+
 main() {
   detect_compose
   fetch_compose_file
@@ -262,6 +285,9 @@ main() {
   require_relay_token
   ensure_exec_token
   ensure_control_plane_profile
+  # Before the key generator below, which runs inside the harness image: a stale one may ship a
+  # different generator, or none.
+  pull_images
   # Only a control plane needs the MU1 secrets, and generating them needs the docker CLI and a harness
   # image that ships the generator. A stack without the profile needs neither; a later re-run with a
   # client id fills them in.
