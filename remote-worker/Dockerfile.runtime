@@ -2,7 +2,7 @@
 # (produced by build-image.sh). No Go toolchain or module fetch happens here, so
 # the in-cluster OpenShift build needs no egress to module proxies.
 #
-# It DOES now need egress to github.com, for the pinned ripgrep tarball the `rg` stage below
+# It DOES now need egress to github.com, for the pinned ripgrep and gh tarballs the stages below
 # fetches. That is a new requirement on the in-cluster build path and would fail in a disconnected
 # cluster; the alternative was leaving the agent's Grep and Find tools broken in every sandbox built
 # from this file. If a disconnected build is ever needed, have build-image.sh place `rg` in dist/
@@ -69,15 +69,50 @@ RUN set -eux; \
     rm -rf "/tmp/${tarball}" /tmp/rg.sha256 "/tmp/ripgrep-${RG_VERSION}-${target}"; \
     /usr/local/bin/rg --version
 
+# gh (the GitHub CLI) is vendored for the same reason as rg: docs/sbx/user-guide.md promises `gh`
+# works in a sandbox (`gh pr create` under the sbx credentials feature), it is not in the UBI 9
+# repositories, and adding GitHub's own dnf repo would put a third-party repository into an image
+# that executes model-authored commands. Upstream release tarball, pinned by version and checked
+# against the sha256 the release publishes (gh_<version>_checksums.txt). The upstream binary is
+# dynamically linked against glibc only, which ubi-minimal carries; the `gh --version` at the end
+# of the RUN fails the build closed if that ever stops being true.
+#
+# To bump: change GH_VERSION and BOTH digests together, taking the new values from the release's
+# checksums file. Arch comes from `uname -m` for the same reason as the rg stage.
+# hadolint ignore=DL3007
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS gh
+ARG GH_VERSION=2.103.3
+ARG GH_SHA256_X86_64=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+ARG GH_SHA256_AARCH64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63
+# hadolint ignore=DL3041
+RUN microdnf install -y --nodocs tar gzip \
+    && microdnf clean all
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)  distro=linux_amd64;  sha="$GH_SHA256_X86_64" ;; \
+      aarch64) distro=linux_arm64;  sha="$GH_SHA256_AARCH64" ;; \
+      *) echo "no pinned gh build for $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    tarball="gh_${GH_VERSION}_${distro}.tar.gz"; \
+    curl -fsSL -o "/tmp/${tarball}" \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${tarball}"; \
+    printf '%s  %s\n' "${sha}" "/tmp/${tarball}" > /tmp/gh.sha256; \
+    sha256sum -c /tmp/gh.sha256; \
+    tar -xzf "/tmp/${tarball}" -C /tmp; \
+    install -m 755 "/tmp/gh_${GH_VERSION}_${distro}/bin/gh" /usr/local/bin/gh; \
+    rm -rf "/tmp/${tarball}" /tmp/gh.sha256 "/tmp/gh_${GH_VERSION}_${distro}"; \
+    /usr/local/bin/gh --version
+
 # This is a standalone demo image that tracks the current UBI 9 minor; a pinned
 # digest would go stale silently, and microdnf package pinning breaks on minor
 # bumps for the same reason .hadolint.yaml already ignores DL3018 for Alpine.
 # hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
-# git and python3: see the same block in ./Dockerfile. cmd/worker/main.go's `probed` list advertises
-# them as this worker's capabilities and they were not present, and a sandbox without git cannot run
-# a tool call resembling the workloads spec §2.3's duty bases were measured from. With `rg` from the
-# stage above, all six probed tools now resolve; dockerfile_parity_test.go fails if that regresses.
+# git, python3 and gh: see the same block in ./Dockerfile. cmd/worker/main.go's `probed` list
+# advertises them as this worker's capabilities and they were not present, and a sandbox without git
+# cannot run a tool call resembling the workloads spec §2.3's duty bases were measured from. With
+# `rg` and `gh` from the stages above, all seven probed tools now resolve; dockerfile_parity_test.go
+# fails if that regresses.
 # curl-minimal and ca-certificates: see the same block in ./Dockerfile (#368).
 # tar, gzip and util-linux-core: see the same block in ./Dockerfile (ADR-0038).
 # hadolint ignore=DL3041
@@ -85,6 +120,7 @@ RUN microdnf install -y --nodocs bash coreutils-single findutils file git python
     && microdnf clean all
 COPY remote-worker /usr/local/bin/remote-worker
 COPY --from=rg /usr/local/bin/rg /usr/local/bin/rg
+COPY --from=gh /usr/local/bin/gh /usr/local/bin/gh
 # See the same block in ./Dockerfile: the harness execs tool calls from /workspace (the default
 # KAGENTI_SANDBOX_CWD), and without it every exec dies on `cd` before running the command, which
 # surfaces as a tool error from a sandbox that is attached and healthy. WORKDIR for the same reason

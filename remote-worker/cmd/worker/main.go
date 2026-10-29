@@ -37,7 +37,7 @@ const (
 
 // probed is the fixed list checked against PATH for Hello.capabilities. The pool
 // will eventually match on these (relay.ts:74 defers it), so they must be true.
-var probed = []string{"bash", "rg", "base64", "file", "python3", "git"}
+var probed = []string{"bash", "rg", "base64", "file", "python3", "git", "gh"}
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
