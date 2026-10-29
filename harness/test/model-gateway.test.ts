@@ -85,6 +85,55 @@ describe('applyModelGateway', () => {
     expect(m.headers.Authorization).toBe('Bearer env-tok');
   });
 
+  describe('an Anthropic OAuth token (#595)', () => {
+    const OAT = 'sk-ant-oat01-not-real'; // notsecret
+    const oatConfig = {
+      anthropicBaseUrl: 'https://api.anthropic.com',
+      upstreamCredential: { mode: 'direct' as const, value: OAT },
+    };
+
+    it("adds no anthropic-beta of its own: pi's OAuth defaults govern", () => {
+      // pi's client computes claude-code-20250219,oauth-2025-04-20 + its per-request betas when its
+      // resolved key is the token; a header here would REPLACE that list wholesale.
+      const m = applyModelGateway(baseModel, oatConfig) as any;
+      expect(m.headers.Authorization).toBe(`Bearer ${OAT}`);
+      expect(m.headers['anthropic-beta']).toBeUndefined();
+    });
+
+    it('appends the oauth beta to a model that carries its own anthropic-beta', () => {
+      // mergeHeaders is a plain Object.assign, so a model-level anthropic-beta replaces pi's OAuth
+      // betas entirely; without oauth-2025-04-20 the token 401s (PR #658 review). Keep the model's
+      // betas, add the one the token needs.
+      const custom = {
+        id: 'claude-haiku-4-5',
+        headers: { 'anthropic-beta': 'interleaved-thinking-2025-05-14' },
+      } as never;
+      const m = applyModelGateway(custom, oatConfig) as any;
+      expect(m.headers['anthropic-beta']).toBe('interleaved-thinking-2025-05-14,oauth-2025-04-20');
+    });
+
+    it('leaves a model beta list that already carries the oauth beta alone', () => {
+      const custom = {
+        id: 'claude-haiku-4-5',
+        headers: { 'anthropic-beta': 'oauth-2025-04-20' },
+      } as never;
+      const m = applyModelGateway(custom, oatConfig) as any;
+      expect(m.headers['anthropic-beta']).toBe('oauth-2025-04-20');
+    });
+
+    it('does not touch anthropic-beta for a non-OAuth token', () => {
+      const custom = {
+        id: 'claude-haiku-4-5',
+        headers: { 'anthropic-beta': 'custom-beta' },
+      } as never;
+      const m = applyModelGateway(custom, {
+        anthropicBaseUrl: 'https://gw.example/v1',
+        upstreamCredential: { mode: 'direct' as const, value: 'gw-token' }, // notsecret
+      }) as any;
+      expect(m.headers['anthropic-beta']).toBe('custom-beta');
+    });
+  });
+
   describe('a tagged upstream credential (MU1 spec §3.6)', () => {
     it('takes precedence over both anthropicAuthToken and the environment', () => {
       // MU1's work is to make `config` carry the RIGHT SUBJECT's token; the gateway function itself

@@ -132,8 +132,9 @@ export function checkExchangeAuth(
  */
 export const OPERATOR_FALLBACK_NAME = 'operator-fallback';
 
-/** The two direct-mode (header, secret, endpoint) triples known to 401 upstream (#368). */
-export type DirectModeMismatch = 'bearer-to-anthropic' | 'raw-key-elsewhere';
+/** The three direct-mode (header, secret, endpoint) triples known to fail upstream (#368, #595). */
+export type DirectModeMismatch =
+  'bearer-to-anthropic' | 'raw-key-elsewhere' | 'oauth-token-elsewhere';
 
 /**
  * Which known-bad shape a direct-mode send would be, or undefined for none. Shared by the per-turn
@@ -146,10 +147,16 @@ export function directModeMismatch(
   baseUrl: string,
 ): DirectModeMismatch | undefined {
   const host = URL.parse(baseUrl)?.hostname;
-  // Bearer there always 401s: it reads API keys from x-api-key only.
-  if (header === 'authorization' && host === 'api.anthropic.com') return 'bearer-to-anthropic';
+  // An Anthropic OAuth token is the one Bearer value api.anthropic.com reads (#595); any other
+  // Bearer there always 401s, because it reads API keys from x-api-key only.
+  const oauthToken = secret.startsWith('sk-ant-oat');
+  if (header === 'authorization' && host === 'api.anthropic.com' && !oauthToken) {
+    return 'bearer-to-anthropic';
+  }
   // A raw Anthropic key aimed anywhere else is a misdirected secret (spec §6.2) and a 401 there.
   if (secret.startsWith('sk-ant-api') && host !== 'api.anthropic.com') return 'raw-key-elsewhere';
+  // So is a subscription token: no other host can read it.
+  if (oauthToken && host !== 'api.anthropic.com') return 'oauth-token-elsewhere';
   return undefined;
 }
 
@@ -274,9 +281,14 @@ export function refuseMisdirectedSecret(r: ResolvedInference, sessionId?: string
           'SH_DEFAULT_INFERENCE_ENDPOINT is api.anthropic.com, which reads API keys from ' +
           'x-api-key; the deployment operator must set SH_OPERATOR_INFERENCE_HEADER=x-api-key or ' +
           'point SH_DEFAULT_INFERENCE_ENDPOINT at a gateway'
-        : 'the operator fallback token (SH_OPERATOR_INFERENCE_TOKEN) is an Anthropic API key, but ' +
-          `SH_DEFAULT_INFERENCE_ENDPOINT resolves to ${host ?? 'an unparseable URL'}; the ` +
-          'deployment operator must fix the pair, or you can store your own inference credential';
+        : mismatch === 'raw-key-elsewhere'
+          ? 'the operator fallback token (SH_OPERATOR_INFERENCE_TOKEN) is an Anthropic API key, but ' +
+            `SH_DEFAULT_INFERENCE_ENDPOINT resolves to ${host ?? 'an unparseable URL'}; the ` +
+            'deployment operator must fix the pair, or you can store your own inference credential'
+          : 'the operator fallback token (SH_OPERATOR_INFERENCE_TOKEN) is an Anthropic OAuth token ' +
+            '(sk-ant-oat…), but SH_DEFAULT_INFERENCE_ENDPOINT resolves to ' +
+            `${host ?? 'an unparseable URL'}; the deployment operator must point it at ` +
+            'https://api.anthropic.com, which is the only host that reads it';
     console.error(`[control-plane] operator fallback misconfigured: ${why}`);
     throw new CpError('credential_unavailable', why, sessionId);
   }
@@ -293,6 +305,15 @@ export function refuseMisdirectedSecret(r: ResolvedInference, sessionId?: string
       'credential_required',
       `credential '${credentialName}' is an Anthropic API key, but its endpoint resolves to ` +
         `${host ?? 'an unparseable URL'}: set its endpoint to https://api.anthropic.com`,
+      sessionId,
+    );
+  }
+  if (mismatch === 'oauth-token-elsewhere') {
+    throw new CpError(
+      'credential_required',
+      `credential '${credentialName}' is an Anthropic OAuth token, but its endpoint resolves to ` +
+        `${host ?? 'an unparseable URL'}, which cannot read it: set its endpoint to ` +
+        'https://api.anthropic.com',
       sessionId,
     );
   }

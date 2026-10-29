@@ -253,6 +253,21 @@ describe('fetchModelCatalog — Anthropic', () => {
       expect(call.redirect).toBe('error');
     }
   });
+
+  it('asks with the oauth beta header for an Anthropic OAuth token (#595)', async () => {
+    // api.anthropic.com reads an OAuth token from Authorization: Bearer only with the
+    // oauth beta header, which pi's client sends for its own Claude Pro logins.
+    const { f, calls } = fakeFetch(json({ data: [{ id: 'claude-opus-4-8' }], has_more: false }));
+    const oat: InferenceTarget = {
+      baseUrl: 'https://api.anthropic.com',
+      secret: 'sk-ant-oat01-not-real', // notsecret
+      header: 'authorization',
+    };
+    await fetchModelCatalog(oat, HOSTS, f);
+    expect(calls[0]!.headers.authorization).toBe('Bearer sk-ant-oat01-not-real');
+    expect(calls[0]!.headers['anthropic-beta']).toContain('oauth-2025-04-20');
+    expect(calls[0]!.headers['x-api-key']).toBeUndefined();
+  });
 });
 
 describe('chooseModel', () => {

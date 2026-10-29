@@ -273,7 +273,14 @@ async function readCatalog(
     target.header === 'x-api-key'
       ? { 'x-api-key': target.secret }
       : { authorization: `Bearer ${target.secret}` };
-  if (isAnthropic) headers['anthropic-version'] = '2023-06-01';
+  if (isAnthropic) {
+    headers['anthropic-version'] = '2023-06-01';
+    // An Anthropic OAuth token is read only with the oauth beta header (#595), the same pair pi's
+    // client sends for a Claude Pro login. A raw key sends no beta and is unaffected.
+    if (target.secret.startsWith('sk-ant-oat')) {
+      headers['anthropic-beta'] = 'claude-code-20250219,oauth-2025-04-20';
+    }
+  }
   // One timeout signal bounds the entire catalog call, all pages included.
   const signal = AbortSignal.timeout(timeoutMs);
   if (!isAnthropic) {

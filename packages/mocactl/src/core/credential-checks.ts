@@ -23,13 +23,12 @@ const BEARER_KINDS = new Set(['bearer', 'oauth2-token']);
 const ANTHROPIC_API_HOST = 'api.anthropic.com';
 
 /**
- * The control plane's write-time inference checks (credential-store.ts, #368), mirrored so the form
- * and the CLI say what to change before submitting. The server stays authoritative; an unknown
- * kind is left to it. This half needs no secret; inferenceSecretProblem is the other.
+ * The control plane's write-time inference checks (credential-store.ts, #368, #595), mirrored so
+ * the form and the CLI say what to change before submitting. The server stays authoritative; an
+ * unknown kind is left to it. This half needs no secret; inferenceSecretProblem is the other.
  */
 function inferenceEndpointProblem(values: Record<string, string>): string | undefined {
   if (kindFields(values.kind)?.length !== 1) return undefined;
-  const bearer = BEARER_KINDS.has(values.kind);
   const endpoint = values.endpoint?.trim() ?? '';
   if (!endpoint) return undefined;
   let url: URL;
@@ -39,11 +38,23 @@ function inferenceEndpointProblem(values: Record<string, string>): string | unde
     return 'endpoint must be an absolute URL, e.g. https://api.anthropic.com';
   }
   if (url.hostname !== ANTHROPIC_API_HOST) return undefined;
-  if (bearer) return `${ANTHROPIC_API_HOST} reads API keys from x-api-key: choose kind api-key`;
+  // Whether a Bearer value works there depends on the secret — an Anthropic OAuth token is the one
+  // Bearer value it reads (#595) — so that check is inferenceSecretProblem's, which has both halves.
   if (url.pathname !== '/' || url.search !== '') {
     return `use https://${ANTHROPIC_API_HOST} as the endpoint (no /v1)`;
   }
   return undefined;
+}
+
+/** Whether the endpoint resolves to api.anthropic.com; false when absent or unparseable (the endpoint half reports a bad URL). */
+function isAnthropicEndpoint(values: Record<string, string>): boolean {
+  const endpoint = values.endpoint?.trim() ?? '';
+  if (!endpoint) return false;
+  try {
+    return new URL(endpoint).hostname === ANTHROPIC_API_HOST;
+  } catch {
+    return false;
+  }
 }
 
 /** The secret's half of the inference checks. Messages name key PREFIXES only, never the value. */
@@ -55,10 +66,20 @@ function inferenceSecretProblem(
   if (fields?.length !== 1) return undefined;
   const secret = secretFields[fields[0]!] ?? '';
   if (secret.startsWith('sk-ant-oat')) {
-    return 'Anthropic OAuth tokens (sk-ant-oat…) are not supported: use an API key (sk-ant-api…) with kind api-key';
+    // The one Bearer value api.anthropic.com reads (#595), and the only host that reads it.
+    if (!BEARER_KINDS.has(values.kind)) {
+      return 'an Anthropic OAuth token (sk-ant-oat…) is read from Authorization: Bearer: choose kind oauth2-token or bearer';
+    }
+    if (values.endpoint?.trim() && !isAnthropicEndpoint(values)) {
+      return `an Anthropic OAuth token (sk-ant-oat…) is only read by ${ANTHROPIC_API_HOST}: use endpoint https://${ANTHROPIC_API_HOST}`;
+    }
+    return undefined;
   }
   if (BEARER_KINDS.has(values.kind) && secret.startsWith('sk-ant-api')) {
     return 'an Anthropic API key (sk-ant-api…) is sent as x-api-key: choose kind api-key, endpoint https://api.anthropic.com';
+  }
+  if (BEARER_KINDS.has(values.kind) && isAnthropicEndpoint(values)) {
+    return `${ANTHROPIC_API_HOST} reads API keys from x-api-key: choose kind api-key, or an Anthropic OAuth token (sk-ant-oat…) with kind oauth2-token`;
   }
   return undefined;
 }

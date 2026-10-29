@@ -1,4 +1,5 @@
 import {
+  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
@@ -698,10 +699,74 @@ export function applyModelGateway<M extends { headers?: Record<string, unknown> 
                 ...baseModel.headers,
                 Authorization: `Bearer ${authToken}`,
                 'x-api-key': null, // strip x-api-key when using gateway Bearer auth
+                // pi merges model.headers OVER its OAuth defaults with a plain Object.assign, so a
+                // model-level anthropic-beta replaces the betas pi computes for an sk-ant-oat key —
+                // including oauth-2025-04-20, without which the token 401s (PR #658 review). Keep
+                // the model's betas and append the one the token needs. (The claude-code beta and
+                // pi's per-request betas are lost to such an override either way; auth survives.)
+                ...(isAnthropicOauthToken(authToken) && carriesAnthropicBeta(baseModel.headers)
+                  ? {
+                      'anthropic-beta': appendOauthBeta(
+                        (baseModel.headers as Record<string, unknown>)['anthropic-beta'],
+                      ),
+                    }
+                  : {}),
               }) as unknown as Record<string, string>,
         }
       : {}),
   };
+}
+
+/** An Anthropic OAuth (Claude Pro/Max subscription) token; the one Bearer value api.anthropic.com reads (#595). */
+function isAnthropicOauthToken(token: string): boolean {
+  return token.startsWith('sk-ant-oat');
+}
+
+/** Whether the model's own headers name anthropic-beta, which would override pi's OAuth betas. */
+function carriesAnthropicBeta(headers: Record<string, unknown> | undefined): boolean {
+  return typeof headers?.['anthropic-beta'] === 'string';
+}
+
+/** The model's beta list plus the oauth beta, unless it already carries it. */
+function appendOauthBeta(beta: unknown): string {
+  const list = beta as string;
+  return list.includes('oauth-2025-04-20') ? list : `${list},oauth-2025-04-20`;
+}
+
+/**
+ * The per-session auth storage for a caller credential that is an Anthropic OAuth token (#595).
+ *
+ * pi-ai's Anthropic client enables its OAuth wire shape — Authorization: Bearer plus the
+ * `anthropic-beta: oauth-2025-04-20` header and the Claude Code identity it sends for its own
+ * Claude Pro logins — only when the API key IT resolves (authStorage.getApiKey, not a header)
+ * is an sk-ant-oat token. A caller's credential normally rides model.headers, which cannot carry
+ * any of that; this hands pi the token through an IN-MEMORY AuthStorage scoped to the session's
+ * own registry instead. Nothing is persisted and nothing is written to the environment, so no
+ * caller's credential becomes process-wide (MI1 §5 R2 — the same boundary the env sentinel holds).
+ *
+ * Beyond the auth header, pi's OAuth path changes the turn's requests (PR #658 review): it
+ * prepends the Claude Code system prompt ("You are Claude Code…") ahead of the harness's own,
+ * renames tools to Claude Code's wire names (toClaudeCodeName), and drops the session-affinity
+ * headers the API-key branch sends. A subscription token therefore only ever runs as a Claude
+ * Code-shaped session — which is also the terms question the reviewer flagged: consumer OAuth
+ * tokens are meant for Anthropic's own apps.
+ *
+ * Undefined for every other credential, which keeps today's model.headers path unchanged.
+ */
+export function oauthAuthStorage(
+  model: { provider: string },
+  config?: Pick<TurnConfig, 'upstreamCredential'>,
+): AuthStorage | undefined {
+  const credential = config?.upstreamCredential;
+  // Bearer-bound sk-ant-oat only: placeholders never reach upstream as themselves, and the control
+  // plane refuses an OAuth token on an x-api-key binding at PUT (credential-store.ts).
+  if (!isAnthropicOauthToken(credential?.value ?? '')) return undefined;
+  if (credential!.header === 'x-api-key') return undefined;
+  const storage = AuthStorage.inMemory();
+  // Keyed on the provider pi resolves the request key by, so a synthesized model's overridden
+  // provider name (SH_MODEL_PROVIDER) resolves the same override.
+  storage.setRuntimeApiKey(model.provider, credential!.value);
+  return storage;
 }
 
 /**
@@ -1040,11 +1105,14 @@ async function executeTurnCore(
     : requireModel(provider, modelId);
   const model = applyModelGateway(baseModel, config);
 
+  // An Anthropic OAuth token takes pi's own OAuth client path, not model.headers alone (#595).
+  const authStorage = oauthAuthStorage(model, config);
   const { session } = await createAgentSession({
     sessionManager,
     model,
     resourceLoader,
     settingsManager,
+    ...(authStorage ? { authStorage } : {}),
   });
 
   // Per-session model spec §5.3: a switch to a smaller window compacts here, not after a failed request.

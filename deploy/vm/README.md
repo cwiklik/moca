@@ -322,7 +322,9 @@ The control plane refuses to boot on a fallback that cannot work, naming the set
 - no token;
 - no default endpoint;
 - an Anthropic key on the Bearer header, or aimed at anything but `https://api.anthropic.com`;
-- an `sk-ant-oat…` OAuth token.
+- an `sk-ant-oat…` OAuth token: the fallback is shared by every caller, and one Claude Pro/Max
+  subscription must not serve them all. Callers can store their own OAuth token as an inference
+  credential; the shared fallback cannot.
 
 `journalctl -u sh-control-plane` shows which. `setup-vm.sh` itself stops on:
 

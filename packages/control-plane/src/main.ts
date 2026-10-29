@@ -289,10 +289,16 @@ export function checkInferenceConfig(c: CpConfig): void {
         'no endpoint of its own',
     );
   }
+  // A caller's OWN sk-ant-oat credential is a working shape (#595), but the operator fallback is
+  // shared by every caller, and spending one person's Claude Pro/Max subscription on all of them
+  // is account sharing on a personal plan (PR #658 review). Refused in every mode, including
+  // placeholder, because this is policy rather than a wire-shape check.
   if (token.startsWith('sk-ant-oat')) {
     throw new Error(
-      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), which the inference ' +
-        'path cannot send; use an API key (sk-ant-api…)',
+      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), which cannot be the ' +
+        'shared operator fallback: one subscription must not serve every caller. Use a gateway ' +
+        'token or an Anthropic API key (sk-ant-api…); callers may store their own OAuth token as ' +
+        'an inference credential',
     );
   }
   // Placeholder mode: the injector, not the harness, picks the upstream header (exchange.ts).
@@ -310,6 +316,14 @@ export function checkInferenceConfig(c: CpConfig): void {
       'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic API key (sk-ant-api…), but ' +
         'SH_DEFAULT_INFERENCE_ENDPOINT is not https://api.anthropic.com: set it to ' +
         'https://api.anthropic.com with SH_OPERATOR_INFERENCE_HEADER=x-api-key, or use a gateway token',
+    );
+  }
+  if (mismatch === 'oauth-token-elsewhere') {
+    throw new Error(
+      'SH_OPERATOR_INFERENCE_TOKEN is an Anthropic OAuth token (sk-ant-oat…), but ' +
+        'SH_DEFAULT_INFERENCE_ENDPOINT is not https://api.anthropic.com, which is the only host ' +
+        'that reads it: point SH_DEFAULT_INFERENCE_ENDPOINT at https://api.anthropic.com, or use ' +
+        'a gateway token',
     );
   }
 }

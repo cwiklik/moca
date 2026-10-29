@@ -22,7 +22,7 @@ export function credentialFields(): FormField[] {
       label: 'Kind',
       initial: 'bearer',
       suggestions: Object.keys(KNOWN_KINDS),
-      hint: 'inference: bearer for a gateway token (LiteLLM etc.), api-key for an Anthropic API key (sk-ant-api…)',
+      hint: 'inference: bearer for a gateway token (LiteLLM etc.), api-key for an Anthropic API key (sk-ant-api…), oauth2-token for a Claude Pro/Max OAuth token (sk-ant-oat…)',
     },
     { key: 'consumer', label: 'Consumer', initial: 'inference', suggestions: CONSUMERS },
     {

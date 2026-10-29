@@ -100,16 +100,37 @@ describe('checkInferenceConfig at boot', () => {
     expect(m).not.toContain(RAW_KEY);
   });
 
-  it('refuses an Anthropic OAuth token as the operator key', () => {
+  it('refuses an Anthropic OAuth token as the operator key: the fallback is shared by every caller', () => {
+    // PR #658 review: an sk-ant-oat operator fallback would spend one person's Claude Pro/Max
+    // subscription on every caller without their own credential — account sharing on a personal
+    // plan. A caller's OWN OAuth credential is fine (exchange-auth-header.test.ts); the shared
+    // fallback is not, whatever the header or endpoint.
     const oat = 'sk-ant-oat01-not-real'; // notsecret
-    const m = bootError({
-      SH_ALLOW_OPERATOR_FALLBACK: 'true',
-      SH_OPERATOR_INFERENCE_TOKEN: oat,
-      SH_OPERATOR_INFERENCE_HEADER: 'x-api-key',
-      SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
-    });
-    expect(m).toContain('sk-ant-oat');
-    expect(m).not.toContain(oat);
+    for (const env of [
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
+      },
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_OPERATOR_INFERENCE_HEADER: 'x-api-key',
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
+      },
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://litellm.internal',
+      },
+      // Placeholder mode too: the refusal is policy, not a wire-shape check.
+      {
+        SH_OPERATOR_INFERENCE_TOKEN: oat,
+        SH_DEFAULT_INFERENCE_ENDPOINT: 'https://api.anthropic.com',
+        SH_INJECTOR_CONFIGURED: 'true',
+      },
+    ]) {
+      const m = bootError({ SH_ALLOW_OPERATOR_FALLBACK: 'true', ...env });
+      expect(m, JSON.stringify(env)).toContain('sk-ant-oat');
+      expect(m, JSON.stringify(env)).not.toContain(oat);
+    }
   });
 
   it('skips the header check in placeholder mode, where the injector picks the upstream header', () => {
@@ -142,7 +163,8 @@ describe('checkInferenceConfig at boot', () => {
 });
 
 describe('directModeMismatch', () => {
-  it('names the two shapes that 401 upstream and passes the rest', () => {
+  it('names the shapes that 401 upstream and passes the rest', () => {
+    const OAT = 'sk-ant-oat01-not-real'; // notsecret
     expect(directModeMismatch('authorization', GW_TOKEN, 'https://api.anthropic.com')).toBe(
       'bearer-to-anthropic',
     );
@@ -151,6 +173,12 @@ describe('directModeMismatch', () => {
     );
     expect(directModeMismatch('authorization', RAW_KEY, 'https://gw.example')).toBe(
       'raw-key-elsewhere',
+    );
+    // The one Bearer value api.anthropic.com reads: an OAuth token goes through (#595).
+    expect(directModeMismatch('authorization', OAT, 'https://api.anthropic.com')).toBeUndefined();
+    // And it is the only host that reads it: aimed anywhere else, it is a misdirected secret.
+    expect(directModeMismatch('authorization', OAT, 'https://gw.example')).toBe(
+      'oauth-token-elsewhere',
     );
     expect(directModeMismatch('x-api-key', RAW_KEY, 'https://api.anthropic.com')).toBeUndefined();
     expect(directModeMismatch('authorization', GW_TOKEN, 'https://gw.example')).toBeUndefined();

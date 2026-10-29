@@ -76,13 +76,36 @@ describe('parseCredentialBody: inference shapes', () => {
     expect(r.message).toContain("kind 'api-key'");
   });
 
-  it('refuses an Anthropic OAuth token outright', () => {
-    const r = refusal(inference({ secret: { token: 'sk-ant-oat01-not-real' } })); // notsecret
-    expect(r.code).toBe('invalid_request');
-    expect(r.message).toContain('sk-ant-oat');
+  it('accepts an Anthropic OAuth token as kind oauth2-token to the bare api.anthropic.com origin (#595)', () => {
+    // api.anthropic.com also reads OAuth tokens (Authorization: Bearer, with the oauth beta header
+    // the harness's pi client adds): a Claude Pro/Max subscription token is a working shape.
+    const c = parseCredentialBody(
+      'claude-pro',
+      inference({
+        kind: 'oauth2-token',
+        destination: { hosts: ['api.anthropic.com'] },
+        endpoint: 'https://api.anthropic.com',
+        secret: { accessToken: 'sk-ant-oat01-not-real' }, // notsecret
+      }),
+    );
+    expect(inferenceAuthHeader(firstBinding(c.descriptor), 'accessToken')).toBe('authorization');
   });
 
-  it('refuses any Bearer credential to api.anthropic.com, whatever the value', () => {
+  it('refuses an Anthropic OAuth token on an x-api-key binding, naming the Bearer header', () => {
+    const r = refusal(
+      inference({
+        kind: 'api-key',
+        destination: { hosts: ['api.anthropic.com'] },
+        endpoint: 'https://api.anthropic.com',
+        secret: { key: 'sk-ant-oat01-not-real' }, // notsecret
+      }),
+    );
+    expect(r.code).toBe('invalid_request');
+    expect(r.message).toContain('sk-ant-oat');
+    expect(r.message).toContain('Authorization');
+  });
+
+  it('refuses a non-OAuth Bearer credential to api.anthropic.com, whatever the value', () => {
     // Review Focus 3.
     const r = refusal(
       inference({

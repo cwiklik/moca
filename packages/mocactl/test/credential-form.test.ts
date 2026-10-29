@@ -135,7 +135,6 @@ describe('validateCredential: inference shapes that would 401 (#368)', () => {
 
   it.each([
     [{ ...base, token: RAW_KEY }, /kind api-key/],
-    [{ ...base, token: 'sk-ant-oat01-x' }, /sk-ant-oat/], // notsecret
     [{ ...base, endpoint: 'https://api.anthropic.com', token: 'gw' }, /x-api-key/],
     [{ ...anthropic, endpoint: 'https://api.anthropic.com/v1' }, /no \/v1/],
     [{ ...anthropic, endpoint: 'not a url' }, /absolute URL/],
@@ -161,5 +160,43 @@ describe('validateCredential: inference shapes that would 401 (#368)', () => {
     const hint = credentialFields().find((f) => f.key === 'kind')!.hint!;
     expect(hint).toContain('bearer');
     expect(hint).toContain('api-key');
+    expect(hint).toContain('oauth2-token');
+  });
+});
+
+describe('validateCredential: Anthropic OAuth tokens (#595)', () => {
+  const OAT = 'sk-ant-oat01-not-real'; // notsecret
+  const claudePro = {
+    name: 'claude-pro',
+    kind: 'oauth2-token',
+    consumer: 'inference',
+    hosts: 'api.anthropic.com',
+    endpoint: 'https://api.anthropic.com',
+    accessToken: OAT,
+  };
+
+  it('accepts a Claude Pro/Max OAuth token as kind oauth2-token to the bare origin', () => {
+    expect(validateCredential(claudePro)).toBeUndefined();
+  });
+
+  it('accepts the same token under kind bearer, the other Bearer shape', () => {
+    expect(validateCredential({ ...claudePro, kind: 'bearer', token: OAT })).toBeUndefined();
+  });
+
+  it('accepts it with no endpoint, which the deployment default resolves', () => {
+    expect(validateCredential({ ...claudePro, endpoint: '' })).toBeUndefined();
+  });
+
+  it.each([
+    [{ ...claudePro, endpoint: 'https://litellm.internal' }, /only read by api\.anthropic\.com/],
+    [{ ...claudePro, kind: 'api-key', key: OAT }, /Authorization/],
+  ])('refuses %o', (values, message) => {
+    expect(validateCredential(values)).toMatch(message);
+  });
+
+  it('never echoes the token in a message', () => {
+    expect(
+      validateCredential({ ...claudePro, endpoint: 'https://litellm.internal' }),
+    ).not.toContain(OAT);
   });
 });
