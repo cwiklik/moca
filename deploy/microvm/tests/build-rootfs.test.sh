@@ -21,8 +21,11 @@ mkdir -p "$TMP/bin"
 cat >"$TMP/bin/podman" <<'MOCK'
 #!/usr/bin/env bash
 printf 'podman %s\n' "$*" >>"$MOCK_LOG"
+# MOCK_PULL_FAIL makes `podman pull` fail, as an offline host or a private registry does;
+# MOCK_NO_LOCAL_IMAGE makes `image exists` fail, which is what a host holding no copy reports.
 case "$1 ${2:-}" in
-  "image exists") exit 0 ;;
+  "image exists") [ -z "${MOCK_NO_LOCAL_IMAGE:-}" ] || exit 1 ;;
+  "pull "*) [ -z "${MOCK_PULL_FAIL:-}" ] || { echo "mock: unauthorized" >&2; exit 1; } ;;
   "image inspect") echo "sha256:0123abcd" ;;
   "create "*) echo "cid-42" ;;
   "export "*) tar -C "$FIXTURE" -cf - . ;;
@@ -81,6 +84,44 @@ for d in dev proc sys; do
   check "/$d exists as a mount point" "$([ -d "$TMP/out1/$d" ] && echo yes || echo no)" "yes"
 done
 check "the temporary container is removed" "$(grep -c '^podman rm -f cid-42$' "$MOCK_LOG")" "1"
+
+echo "== the image is re-resolved on every build, not reused because a copy is present (#414)"
+# `podman image exists || podman pull` pulled only on a host with NO copy, so a :latest pulled once
+# was exported into every later snapshot -- and a snapshot is built once and run for a long time.
+# The rig's copy predated #372 (HOME on the shared /workspace), which is the P4 half of #414.
+make_fixture "${ALL_TOOLS[@]}"
+: >"$MOCK_LOG"
+bash "$SCRIPT" --out "$TMP/out-pull" --image example/img:1 >"$TMP/run-pull.log" 2>&1
+check "exit 0" "$?" "0"
+check "pulled the image" "$(grep -c '^podman pull example/img:1$' "$MOCK_LOG")" "1"
+# The guard that let a present copy short-circuit the pull must be gone, not merely reordered.
+check "a present local copy no longer skips the pull" \
+  "$(grep -c '^podman image exists' "$MOCK_LOG")" "0"
+
+echo "== a failed pull refuses the build, naming SH_SKIP_PULL"
+make_fixture "${ALL_TOOLS[@]}"
+MOCK_PULL_FAIL=1 bash "$SCRIPT" --out "$TMP/out-pullfail" --image example/img:1 >"$TMP/run-pullfail.log" 2>&1
+check "exit 1" "$?" "1"
+check "names the override" "$(grep -c 'SH_SKIP_PULL' "$TMP/run-pullfail.log")" "1"
+# Refusing is only useful if it refuses BEFORE exporting: a tree built from the stale copy is the
+# artifact this check exists to prevent, and leaving a partial one behind is worse than neither.
+check "no rootfs tree was written" "$([ -e "$TMP/out-pullfail/usr" ] && echo present || echo absent)" "absent"
+
+echo "== SH_SKIP_PULL builds from the local copy, and refuses when there is none"
+make_fixture "${ALL_TOOLS[@]}"
+: >"$MOCK_LOG"
+SH_SKIP_PULL=1 MOCK_PULL_FAIL=1 bash "$SCRIPT" --out "$TMP/out-skip" --image example/img:1 \
+  >"$TMP/run-skip.log" 2>&1
+check "exit 0" "$?" "0"
+check "did not pull" "$(grep -c '^podman pull' "$MOCK_LOG")" "0"
+# The provenance file is what a later operator reads to find out which image a snapshot came from,
+# so a skipped pull must not cost them that.
+check "provenance still records the digest" \
+  "$(grep -c '^digest=sha256:0123abcd$' "$TMP/out-skip/etc/moca-rootfs-source")" "1"
+SH_SKIP_PULL=1 MOCK_NO_LOCAL_IMAGE=1 bash "$SCRIPT" --out "$TMP/out-skip2" --image example/img:1 \
+  >"$TMP/run-skip2.log" 2>&1
+check "exit 1 with no local copy to skip to" "$?" "1"
+check "says the host has no copy" "$(grep -c 'no copy of example/img:1' "$TMP/run-skip2.log")" "1"
 
 echo "== an image missing a required tool is refused, naming it"
 make_fixture bash git python3 base64 file ls cat # no rg

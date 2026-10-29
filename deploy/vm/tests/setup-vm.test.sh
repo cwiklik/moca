@@ -18,6 +18,9 @@ export MOCK_LOG="$TMP/mock.log"
 # setup-vm.sh seeds control-plane.env from these; one exported in the developer's shell would configure
 # every control plane below that the tests expect to stay unconfigured.
 unset SH_GITHUB_CLIENT_ID SH_PUBLIC_HARNESS_URL
+# SH_SKIP_PULL in the developer's shell would turn the pull off under every case below, including
+# the ones asserting that it happens (#414).
+unset SH_SKIP_PULL
 mkdir -p "$TMP/bin"
 for cmd in podman getent pnpm nft; do
   cat >"$TMP/bin/$cmd" <<'MOCK'
@@ -52,6 +55,17 @@ printf 'podman-env SH_EXCHANGE_TOKEN=%s\n' "${SH_EXCHANGE_TOKEN-<unset>}" >>"$MO
 if [[ -n "${MOCK_PODMAN_FAIL-}" && "$*" == ${MOCK_PODMAN_FAIL} ]]; then
   echo "mock podman: forced failure matching '$MOCK_PODMAN_FAIL'" >&2
   exit 1
+fi
+# `image inspect`, for describe_sandbox_image (#414): the id and creation time of the image the
+# sandboxes will run, which the bring-up logs so an operator can tell a stale one from a current
+# one. MOCK_NO_LOCAL_IMAGE exits non-zero instead -- podman's own behaviour when the host holds no
+# copy of the reference, the state a skipped or failed pull leaves behind.
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+  [[ -z "${MOCK_NO_LOCAL_IMAGE-}" ]] || exit 1
+  case "$*" in
+  *.Id*) printf '%s\n' "${MOCK_IMAGE_ID-sha256:102ed4c1cfb9aaaabbbbccccddddeeeeffff0000111122223333444455556666}" ;;
+  *.Created*) printf '%s\n' "${MOCK_IMAGE_CREATED-2026-10-27T09:14:22.000000000Z}" ;;
+  esac
 fi
 if [[ "$1" == "network" && "$2" == "inspect" ]]; then
   if [[ "$*" == *isolate* ]]; then
@@ -1152,6 +1166,68 @@ pass "a missing podman-restart.service warns about the reboot gap instead of abo
 # Restore the plain mock for the rest of the file (main() below asserts on systemctl argv).
 write_systemctl_mock
 
+# --- the sandbox image is pulled, every run (#414) --------------------------------------------
+# `podman run` resolves a reference only when the host has NO copy of it, so a :latest pulled once
+# is what every later run starts the sandboxes on. On the P6.3 rig that copy predated #372: HOME was
+# the shared /workspace rather than /home/sandbox, and nothing in the bring-up's output said so.
+# The containers are this deployment's executors, so which image they run is not a detail.
+# Named rather than called blind: `pull_sandbox_image` missing would otherwise abort this file at
+# `command not found` with no assertion message, which reads as a broken suite rather than as the
+# regression it is.
+declare -F pull_sandbox_image >/dev/null ||
+  fail "setup-vm.sh must define pull_sandbox_image: without it, start_sandboxes runs whatever" \
+    "copy of $SANDBOX_IMAGE this host pulled first (#414)"
+: >"$MOCK_LOG"
+pull_out="$(pull_sandbox_image 2>&1)"
+grep -qE "^podman pull $SANDBOX_IMAGE$" "$MOCK_LOG" ||
+  fail "setup-vm.sh must pull $SANDBOX_IMAGE before starting sandboxes, or the host keeps running" \
+    "whatever :latest it pulled first (#414): $(cat "$MOCK_LOG")"
+# The id, not just the tag: `:latest` is the same string on a current and a pre-#372 host, so an
+# operator comparing what they see against what main builds needs the resolved image.
+[[ "$pull_out" == *102ed4c1cfb9* && "$pull_out" == *2026-10-27* ]] ||
+  fail "the run must report the image id and creation time the sandboxes start from: $pull_out"
+pass "the sandbox image is pulled on every run, and the run says which image it resolved to (#414)"
+
+# A failed pull STOPS the bring-up. Carrying on is precisely the bug: it would start the executors
+# on an unexamined local copy while reporting success, which is how the rig ran a pre-#372 image.
+: >"$MOCK_LOG"
+pull_rc=0
+pull_fail_out="$(MOCK_PODMAN_FAIL='pull *' pull_sandbox_image 2>&1)" || pull_rc=$?
+((pull_rc != 0)) ||
+  fail "a failed pull must stop the bring-up, not start the sandboxes on an unknown local image:" \
+    "$pull_fail_out"
+grep -q 'SH_SKIP_PULL' <<<"$pull_fail_out" ||
+  fail "the refusal must name the override an offline host needs: $pull_fail_out"
+if grep -q 'podman run .*sh-sandbox-' "$MOCK_LOG"; then
+  fail "a failed pull still started a sandbox container: $(cat "$MOCK_LOG")"
+fi
+pass "a failed pull refuses, names SH_SKIP_PULL, and starts no sandbox"
+
+# ...and SH_SKIP_PULL is that way past it: no pull attempted at all (so an offline host waits for no
+# registry timeout), and the image it falls back to is still reported, because that is the value an
+# operator debugging a stale sandbox needs most.
+: >"$MOCK_LOG"
+skip_out="$(SH_SKIP_PULL=1 MOCK_PODMAN_FAIL='pull *' pull_sandbox_image 2>&1)" ||
+  fail "SH_SKIP_PULL must not fail: $skip_out"
+if grep -q '^podman pull' "$MOCK_LOG"; then
+  fail "SH_SKIP_PULL still pulled: $(cat "$MOCK_LOG")"
+fi
+grep -q 'SH_SKIP_PULL' <<<"$skip_out" ||
+  fail "a skipped pull must be visible in the output, not silent: $skip_out"
+[[ "$skip_out" == *102ed4c1cfb9* ]] ||
+  fail "a skipped pull must still report which local image the sandboxes start from: $skip_out"
+pass "SH_SKIP_PULL skips the pull, says so, and still reports the local image"
+
+# A host with no copy at all: describe_sandbox_image has nothing to inspect. It must warn and carry
+# on rather than abort under `set -e` -- `podman run` will pull it, and a bring-up that refuses here
+# would be refusing over its own reporting step, not over anything the deployment needs.
+: >"$MOCK_LOG"
+nolocal_out="$(SH_SKIP_PULL='' MOCK_NO_LOCAL_IMAGE=1 pull_sandbox_image 2>&1)" ||
+  fail "an uninspectable image must not fail the bring-up: $nolocal_out"
+grep -qi 'WARNING' <<<"$nolocal_out" ||
+  fail "an image this host cannot inspect must be warned about: $nolocal_out"
+pass "an image with no local copy warns instead of aborting the bring-up"
+
 # --- Redis persists, and a re-run is not destructive (#410) -----------------------------------
 # Redis holds the control plane's session and ownership index, the harness's own session state and
 # the lease store. It used to run with no -v and an unconditional --replace, so every reboot and
@@ -1810,6 +1886,15 @@ sandbox_line=$(grep -n 'podman run .*sh-sandbox-' "$MOCK_LOG" | head -1 | cut -d
   fail "main() must both load the firewall and start sandboxes: $(cat "$MOCK_LOG")"
 ((firewall_line < sandbox_line)) ||
   fail "main() must load the sandbox firewall before it starts the first sandbox"
+# The pull is only a fix if it happens BEFORE the containers: `podman run --replace` recreates each
+# one from whatever the reference resolves to at that moment, so a pull after it would leave this
+# run's sandboxes on the old image and only the NEXT run would benefit (#414).
+pull_line=$(grep -n "^podman pull $SANDBOX_IMAGE\$" "$MOCK_LOG" | head -1 | cut -d: -f1)
+[[ -n "$pull_line" ]] ||
+  fail "main() must pull the sandbox image: $(grep '^podman' "$MOCK_LOG")"
+((pull_line < sandbox_line)) ||
+  fail "main() must pull the sandbox image before starting the first sandbox (pull at line" \
+    "'$pull_line', sandbox at '$sandbox_line')"
 # A sandbox never receives the exec token -- the credential that authorizes SandboxExec into ANY
 # sandbox -- by any route: not by argv, not from an env file, not inherited.
 exec_token=$(sed -n 's/^MOCA_RELAY_EXEC_TOKEN=//p' "$SH_ENV_DIR/relay.env")
