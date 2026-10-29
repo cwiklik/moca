@@ -90,17 +90,17 @@ another `git worktree` of the same repository, gets a sandbox of its own at its 
 two agents in two worktrees never share, or overwrite, one tree. Each counts toward your quota
 of sandboxes ([Limits](#7-limits)): `mocactl sbx rm` the ones you are done with.
 
-**Run your agent** in the repository. Four are supported, and they differ in how they are wired and
-in how much `up` can take away:
+**Run your agent** in the repository. The supported agents differ in how they are wired and in how
+much `up` can take away:
 
-| Agent                       | How it gets the server                                    | Its local tools                                                |
-| --------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
-| **Claude Code**             | `up` writes `.mcp.json` + `.claude/settings.json`         | Denied (`permissions.deny`), or left to Cortex with `--cortex` |
-| **OpenCode**                | `up` writes `opencode.json`                               | Denied (`tools.<name>: false`)                                 |
-| **[Codex CLI](#codex-cli)** | `mocactl sbx codex`, per run — it reads no project config | Shell tool off; `unified_exec` cannot be disabled              |
-| **[IBM Bob](#ibm-bob)**     | `up` writes `.bob/settings.json`                          | **Not denied** — Bob has no deny list                          |
+| Agent                       | How it gets the server                                                              | Its local tools                                                |
+| --------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| **Claude Code**             | `up` writes `.mcp.json` + `.claude/settings.json`; or `mocactl sbx claude`, per run | Denied (`permissions.deny`), or left to Cortex with `--cortex` |
+| **OpenCode**                | `up` writes `opencode.json`                                                         | Denied (`tools.<name>: false`)                                 |
+| **[Codex CLI](#codex-cli)** | `mocactl sbx codex`, per run — it reads no project config                           | Shell tool off; `unified_exec` cannot be disabled              |
+| **[IBM Bob](#ibm-bob)**     | `up` writes `.bob/settings.json`                                                    | **Not denied** — Bob has no deny list                          |
 
-The first two need nothing beyond `up`, so start them as you normally do:
+Claude Code and OpenCode need nothing beyond `up`, so start them as you normally do:
 
 ```bash
 claude
