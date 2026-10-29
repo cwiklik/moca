@@ -194,9 +194,12 @@ describe('mocactl sbx doctor (SBX0 §6.1)', () => {
   it('says the denied state is checked in the project config only (review I2)', async () => {
     const w = world();
     const cs = await runDoctor(w.ctx(), w.r, SBX, fakeExec().factory, CURRENT);
-    expect(byName(cs, 'agent config').detail).toContain(
-      "in this repository's project config; user-level and managed settings are not checked",
-    );
+    const detail = byName(cs, 'agent config').detail;
+    expect(detail).toContain("in this repository's project config");
+    expect(detail).toContain('user-level and managed settings are not checked');
+    // Bob is in the check, and its local tools are not denied: say so rather than imply parity.
+    expect(detail).toContain('IBM Bob');
+    expect(detail).toContain('its own tools stay available');
   });
 
   it('fails the agent-config check when an OpenCode agent re-enables a tool', async () => {

@@ -80,11 +80,13 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
   mocactl sbx up [--template T] [--name N] [--include-secrets] [--max-push MiB] [--no-agent-config] [--cortex]
                                                  in a git repository: create or reuse its sandbox,
                                                  push the working tree, bind it in .sbx/sandbox.json,
-                                                 and point Claude Code and OpenCode at the sandbox's
-                                                 MCP tools with their local tools denied (merged
+                                                 and point Claude Code, OpenCode and IBM Bob at the
+                                                 sandbox's MCP tools, with their local tools denied
+                                                 (Bob's cannot be: it has no deny list) (merged
                                                  into .mcp.json, .claude/settings.json,
-                                                 opencode.json, CLAUDE.md, AGENTS.md; a value there
-                                                 that conflicts stops up before anything is done)
+                                                 opencode.json, .bob/settings.json, CLAUDE.md,
+                                                 AGENTS.md; a value there that conflicts stops up
+                                                 before anything is done)
                                                  (a reused sandbox with changes not yet pulled is
                                                  left unpushed, with a warning, and up exits 0)
                                                  (--cortex: Cortex v0.9.3+ blocks the local tools
