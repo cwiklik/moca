@@ -163,8 +163,9 @@ mocactl sbx pull --apply
 ```
 
 There is no step for configuring Codex, because there is nothing to configure: `mocactl sbx codex`
-passes the server on the command line for that one run. The rest of this section is why, and what
-to check when a step does not behave.
+passes the server on the command line for that one run.
+
+**In detail**, step by step — why each one is there, and what to check when it does not behave.
 
 **Install it** (Node.js 22 or later, the same floor as `mocactl`):
 
@@ -291,8 +292,7 @@ Unlike Codex there is no launcher, because `up` can configure Bob; and unlike Cl
 OpenCode, **`up` cannot take Bob's own tools away** — see the warning below before using it
 unattended.
 
-Install Bob-Shell per [its install guide](https://bob.ibm.com/docs/ide/getting-started/install),
-then start it in the repository as you would the others:
+**In detail.** Bob takes a prompt either way:
 
 ```bash
 bob                                               # interactive

@@ -167,8 +167,9 @@ Where to go next:
 - **Guided tour:** [`docs/demos/vm-multi-user-demo.md`](docs/demos/vm-multi-user-demo.md): two
   users, one VM, two sandbox tiers (~40 min). All demos are indexed in [`docs/demos/`](docs/demos/).
 - **Run your coding agent with every command in a microVM:** the SBX0 sandbox service,
-  [`docs/sbx/user-guide.md`](docs/sbx/user-guide.md). Claude Code, OpenCode, Codex and IBM Bob;
-  your laptop's tree is untouched until you pull the agent's work back.
+  [`docs/sbx/user-guide.md`](docs/sbx/user-guide.md). Claude Code and OpenCode run with their own
+  tools denied, so your laptop's tree is untouched until you pull the agent's work back; Codex and
+  IBM Bob are supported too, with weaker containment the guide spells out.
 
 ---
 
