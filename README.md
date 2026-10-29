@@ -166,6 +166,10 @@ Where to go next:
 - **Stay on Kubernetes or OpenShift:** [`deploy/k8s/`](deploy/k8s/README.md).
 - **Guided tour:** [`docs/demos/vm-multi-user-demo.md`](docs/demos/vm-multi-user-demo.md): two
   users, one VM, two sandbox tiers (~40 min). All demos are indexed in [`docs/demos/`](docs/demos/).
+- **Run your coding agent with every command in a microVM:** the SBX0 sandbox service,
+  [`docs/sbx/user-guide.md`](docs/sbx/user-guide.md). Claude Code and OpenCode run with their own
+  tools denied, so your laptop's tree is untouched until you pull the agent's work back; Codex and
+  IBM Bob are supported too, with weaker containment the guide spells out.
 
 ---
 
@@ -283,6 +287,8 @@ Start at the [documentation map](docs/index.md).
 | Leave the Knative/KEDA deployment | [Migration guide](docs/migrating-from-knative.md)                                                                                                                                                                                                                  |
 | Run it for several users          | [Multi-user guide](docs/guides/manage-multi-user-sessions.md)                                                                                                                                                                                                      |
 | Attach a sandbox on another host  | [Remote sandbox guide](docs/guides/remote-sandbox.md)                                                                                                                                                                                                              |
+| Run my coding agent in a sandbox  | [Sandbox service user guide](docs/sbx/user-guide.md)                                                                                                                                                                                                               |
+| Use Codex or IBM Bob with it      | [Codex](docs/sbx/user-guide.md#codex-cli); [IBM Bob](docs/sbx/user-guide.md#ibm-bob)                                                                                                                                                                               |
 | Promote a Claude Code workflow    | [Guide](docs/guides/promote-claude-workflow.md)                                                                                                                                                                                                                    |
 | Look up an environment variable   | [Configuration reference](docs/reference/configuration.md)                                                                                                                                                                                                         |
 | Look up a `mocactl` command       | [`mocactl` reference](docs/reference/cli-mocactl.md)                                                                                                                                                                                                               |
