@@ -344,9 +344,12 @@ header is authoritative.
 - **VM sandbox network:** `MOCA_SANDBOX_SUBNET`, `MOCA_SANDBOX_GATEWAY`, `MOCA_SANDBOX_BRIDGE`.
 - **MicroVM installer:** `MICROVM_SANDBOX_ID`, `MICROVM_WORKSPACE_IDLE`, `MICROVM_SNAPSHOT_DIR`,
   `MICROVM_BIN`, `MICROVM_ATTACH_TIMEOUT`, `MICROVM_ATTACH_SETTLE`, `MICROVM_MAX_COMMITTED_MB`.
-- **Compose `install.sh` inputs:** `SH_COMPOSE_DIR`, `SH_COMPOSE_BASE_URL`, `SH_HARNESS_IMAGE`,
-  `SH_SKIP_PULL` (non-empty runs the images the machine already has instead of pulling; the pull is
-  otherwise fail-closed, because a cached `:latest` is never re-resolved by `up -d`).
+- **`SH_SKIP_PULL`** (non-empty) — run the images this machine already has instead of pulling them.
+  Read by `deploy/compose/install.sh`, `setup-vm.sh` and `deploy/microvm/build-rootfs.sh`. The pull
+  is otherwise fail-closed in all three, because neither `docker compose up -d` nor `podman run`
+  re-resolves a reference the host already holds a copy of — so a `:latest` pulled once is what
+  every later run starts (#349, #414).
+- **Compose `install.sh` inputs:** `SH_COMPOSE_DIR`, `SH_COMPOSE_BASE_URL`, `SH_HARNESS_IMAGE`.
 - **Compose file interpolation (`docker-compose.yml`):** `SH_SANDBOX_IMAGE`, `SH_PORT`, `SH_CP_PORT`,
   `MOCA_RELAY_EXEC_PORT`, `MOCA_RELAY_BRAIN_IP`, `MOCA_BRAIN_SUBNET`, `COMPOSE_PROFILES`.
 - **Kubernetes `setup.sh`:** `SH_P4_SANDBOX_IDS`, `SH_SANDBOX_EGRESS_EXCEPT`, `SH_ROUTE_DOMAIN`,

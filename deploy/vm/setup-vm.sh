@@ -22,7 +22,12 @@
 #   SH_SANDBOX_COUNT     Number of sandbox containers to start (default 2)
 #   SANDBOX_IMAGE        Sandbox container image (default
 #                          ghcr.io/rossoctl/moca-remote-worker:latest, the image
-#                          that attaches to the relay -- compose's sandbox image too)
+#                          that attaches to the relay -- compose's sandbox image too). A mutable
+#                          tag, so it is pulled on every run (see pull_sandbox_image, #414)
+#   SH_SKIP_PULL         Non-empty: do not pull SANDBOX_IMAGE, start the sandboxes on whatever copy
+#                          this host already has -- an offline host, or a SANDBOX_IMAGE built on
+#                          the VM that no registry serves. Which image they start from is logged
+#                          either way
 #   SH_SANDBOX_RELAY_ADDR  Address each sandbox container uses to dial the relay (default
 #                          host.containers.internal:<SH_RELAY_PORT from relay.env>). Reaching
 #                          the host from inside a container is the part of this script least
@@ -1044,6 +1049,53 @@ sandbox_relay_addr() {
   echo "${SH_SANDBOX_RELAY_ADDR:-host.containers.internal:$(relay_port)}"
 }
 
+# What the sandboxes will actually run, by id and creation time rather than by the tag that was
+# asked for: `:latest` names nothing an operator can compare against the behaviour they are seeing,
+# and "which image is this host on" was unanswerable from a bring-up's output (#414).
+describe_sandbox_image() {
+  local id created
+  id="$(podman image inspect --format '{{.Id}}' "$SANDBOX_IMAGE" 2>/dev/null || true)"
+  created="$(podman image inspect --format '{{.Created}}' "$SANDBOX_IMAGE" 2>/dev/null || true)"
+  if [[ -z "$id" ]]; then
+    echo "WARNING: no local copy of $SANDBOX_IMAGE to inspect, so this run cannot report which" \
+      "image the sandboxes start from. podman will pull it when the first container starts." >&2
+    return 0
+  fi
+  # `sha256:` off BEFORE truncating, so the twelve characters shown are the twelve `podman images`
+  # prints in its IMAGE ID column -- truncating the prefixed form yields `sha256:102ed`, five digits
+  # of a digest, which compares against nothing the operator can see.
+  id="${id#sha256:}"
+  log "sandbox image $SANDBOX_IMAGE is ${id:0:12}, created $created"
+}
+
+# `podman run` pulls an image only when the host has NO copy of the reference, so a :latest pulled
+# once -- weeks ago, before #372 moved HOME off the shared /workspace -- is never re-resolved and
+# every later run starts the sandboxes on it (#414). The rig hit exactly that: a pre-#372 image,
+# with nothing in this script's output hinting the containers were not what main builds.
+# SANDBOX_IMAGE's default is a mutable tag that build.yaml republishes on every push to main, so
+# pull explicitly, every run.
+#
+# A failed pull is FATAL rather than a warning, for the same reason the stale image was a bug: these
+# containers are this deployment's executors, and quietly starting them on whatever copy the host
+# happens to hold is the failure being fixed. SH_SKIP_PULL is the way past it -- an offline host, or
+# a SANDBOX_IMAGE built on the VM that no registry serves.
+pull_sandbox_image() {
+  if [[ -n "${SH_SKIP_PULL:-}" ]]; then
+    log "SH_SKIP_PULL is set: not pulling $SANDBOX_IMAGE, the sandboxes start on this host's copy"
+  else
+    log "pulling $SANDBOX_IMAGE"
+    if ! podman pull "$SANDBOX_IMAGE"; then
+      echo "could not pull $SANDBOX_IMAGE. The sandbox containers are this deployment's executors," \
+        "so starting them on whatever copy this host already has is the failure this check exists" \
+        "to prevent (#414) -- a stale one differs in HOME, in its toolchain, and in what each turn" \
+        "can do. Re-run with SH_SKIP_PULL=1 to accept the local copy, or fix this host's access to" \
+        "the registry." >&2
+      return 1
+    fi
+  fi
+  describe_sandbox_image
+}
+
 start_sandboxes() {
   log "starting $SH_SANDBOX_COUNT sandbox containers"
   local i token addr
@@ -1170,6 +1222,9 @@ main() {
   start_redis
   ensure_sandbox_network
   install_sandbox_firewall
+  # Before start_sandboxes, which is what `podman run` would otherwise resolve the image for: by
+  # then the stale copy is already the container's, and --replace has recreated it from that.
+  pull_sandbox_image
   start_sandboxes
   start_services
   report_done

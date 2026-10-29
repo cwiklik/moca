@@ -139,10 +139,11 @@ Across those two runs, the script does the following, in this order:
    persistence" below).
 7. Creates a dedicated `moca-sandbox` podman network (fixed subnet `10.89.40.0/24`, gateway
    `10.89.40.1`, `isolate=strict` so it exchanges no traffic with any other podman network) and
-   installs an nftables table that confines it, then starts `SH_SANDBOX_COUNT` (default 2) sandbox
-   containers on that network, wired to reach the relay and to authenticate to it. The firewall is
-   in place before the first sandbox starts. See "Sandbox container networking and the relay
-   token" below.
+   installs an nftables table that confines it, then **pulls `SANDBOX_IMAGE`** and starts
+   `SH_SANDBOX_COUNT` (default 2) sandbox containers on that network, wired to reach the relay and
+   to authenticate to it. The firewall is in place before the first sandbox starts, and the pull
+   before the first container is created (see "The sandbox image is pulled on every run" below).
+   See "Sandbox container networking and the relay token" below.
 8. Enables **and restarts** `sh-relay.service`. Enables `sh-control-plane.service`, and restarts it
    once `SH_GITHUB_CLIENT_ID` and `SH_PUBLIC_HARNESS_URL` are both set in `control-plane.env`;
    until then it is only `try-restart`ed, for the supervisor's reason below. Only **enables**
@@ -645,6 +646,39 @@ failing (it is one package's unit name, not a hard requirement of the bring-up) 
 still completes. On such a host, re-run `setup-vm.sh` after a reboot before expecting turns to
 work.
 
+## The sandbox image is pulled on every run
+
+`podman run` resolves an image reference only when the host has **no** copy of it. So a
+`ghcr.io/rossoctl/moca-remote-worker:latest` pulled once — weeks ago — was what every later
+`setup-vm.sh` run started the sandboxes on, and nothing in the output said which image that was
+(#414). The P6.3 rig hit exactly this: its copy predated #372, so `HOME` inside each sandbox was the
+shared `/workspace` rather than `/home/sandbox`.
+
+`setup-vm.sh` therefore runs `podman pull "$SANDBOX_IMAGE"` before it creates the first container,
+and then logs the image id and creation time the sandboxes are starting from:
+
+```
+==> pulling ghcr.io/rossoctl/moca-remote-worker:latest
+==> sandbox image ghcr.io/rossoctl/moca-remote-worker:latest is 102ed4c1cfb9, created 2026-10-01T…
+```
+
+That id is the one `podman images` prints, so it answers "is this host on the current image?"
+directly. **A failed pull stops the bring-up**: the sandbox containers are this deployment's
+executors, and starting them on an unexamined local copy is the bug being fixed, not a fallback.
+
+`SH_SKIP_PULL=1` is the way past it — an offline host, or a `SANDBOX_IMAGE` you built on the VM
+that no registry serves. It does not attempt the pull at all (so there is no registry timeout to
+wait out), says so in the output, and still logs the local image the containers will run:
+
+```bash
+sudo env SH_SKIP_PULL=1 ./deploy/vm/setup-vm.sh
+```
+
+`deploy/microvm/build-rootfs.sh` pulls the same way, for the same reason: a snapshot is built once
+and run for a long time, so a rootfs exported from a stale copy outlives it. `SH_SKIP_PULL=1` there
+too (it refuses if the host then has no copy at all), and
+`/etc/moca-rootfs-source` inside the tree records the image and digest it came from either way.
+
 ## Redis persistence
 
 Redis holds the control plane's session and ownership index, the harness's own session state, the
@@ -758,7 +792,9 @@ for it.
 image `setup-vm.sh` runs sandbox containers from. It is a variable for the script, not an env-file
 setting: `sudo SANDBOX_IMAGE=<image> ./deploy/vm/setup-vm.sh`. The same name means the
 Kubernetes sandbox pod image to `setup-k8s.sh`, and compose spells this concept
-`SH_SANDBOX_IMAGE`, so do not export one value for all three.
+`SH_SANDBOX_IMAGE`, so do not export one value for all three. The default is a mutable tag, so it is
+pulled on every run; `SH_SKIP_PULL=1` runs the host's copy instead (see "The sandbox image is pulled
+on every run" above).
 
 ## What round one does not claim
 

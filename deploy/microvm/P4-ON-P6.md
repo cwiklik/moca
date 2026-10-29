@@ -143,6 +143,12 @@ shell does not reach the script. Use whatever image P6 was installed with. It re
 any of `bash git rg python3 base64 file ls cat`. It strips the container
 worker binary and records the image and its digest in `/etc/moca-rootfs-source` inside the tree.
 
+It **pulls the reference every run** rather than reusing a copy this host happens to hold: a
+snapshot is built once and run for a long time, so a rootfs exported from a stale `:latest`
+outlives the image it was meant to track (#414 — the rig's predated #372, whose `HOME` was the
+shared `/workspace`). A failed pull refuses the build; `SH_SKIP_PULL=1` exports the local copy
+instead, for an offline host or an `--image` you built here, and refuses if there is no copy at all.
+
 **3. The snapshot:**
 
 ```bash
