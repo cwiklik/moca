@@ -24,6 +24,7 @@ import {
   fieldRefusedByServer,
   resolveSessionOptions,
 } from './core/session-options.js';
+import { sameControlPlane, storedLoginUrl } from './config.js';
 import { workspaceResetText } from './render/blocks.js';
 import { openableUrl, type OsDeps } from './os.js';
 import { ensureRuntimeAuth, sessionManager, setAuth, type Runtime } from './runtime.js';
@@ -52,6 +53,30 @@ function missing(rt: Runtime, io: Io, need: Array<keyof typeof MISSING>): boolea
   const absent = need.filter((k) => !rt.endpoints[k]);
   for (const k of absent) io.err(MISSING[k]);
   return absent.length > 0;
+}
+
+/**
+ * The reason a login that IS on this machine was not used: it belongs to another control plane.
+ * Undefined when there is no login at all, or when the stored one is for the endpoint in use.
+ *
+ * Without this the gates said a bare "not logged in", so the user logged in again -- overwriting
+ * the one `auth.json`, and seeing the same thing next time they switched back. That round trip is
+ * what #529 was reported as ("the token only lasts an hour"); the refresh token was never sent.
+ */
+export function otherControlPlaneLogin(rt: Runtime): string | undefined {
+  const target = rt.endpoints.controlPlaneUrl;
+  if (!target) return undefined;
+  const stored = storedLoginUrl(rt.paths.authFile);
+  return stored && !sameControlPlane(stored, target) ? stored : undefined;
+}
+
+/** `otherControlPlaneLogin` as the clause appended to a "not logged in" line. */
+function mismatchClause(rt: Runtime): string {
+  const stored = otherControlPlaneLogin(rt);
+  return stored
+    ? ` — auth.json holds a login for ${sanitizeRemote(stored)}, but this command targets ` +
+        `${sanitizeRemote(rt.endpoints.controlPlaneUrl!)}; use one URL or run \`mocactl login\``
+    : '';
 }
 
 /** What a device login at this machine's own screen uses: the clipboard and the browser. */
@@ -217,7 +242,7 @@ export async function cmdAuthToken(rt: Runtime, io: Io, json: boolean): Promise<
   if (missing(rt, io, ['controlPlaneUrl']) || !rt.cp) return 2;
   const r = await ensureRuntimeAuth(rt);
   if (r.kind === 'login_required') {
-    io.err('not logged in — run `mocactl login`');
+    io.err('not logged in — run `mocactl login`' + mismatchClause(rt));
     return AUTH_EXIT.loginRequired;
   }
   if (r.kind === 'unreachable') {
@@ -271,6 +296,7 @@ export async function cmdDoctor(rt: Runtime, io: Io, json: boolean): Promise<num
     controlPlaneUrl: rt.endpoints.controlPlaneUrl!,
     harnessOverridden: rt.endpoints.harnessUrl !== undefined,
     loggedIn: apiTokenValid(rt.auth, rt.now()),
+    storedLoginUrl: otherControlPlaneLogin(rt),
   });
   io.out((json ? JSON.stringify(results) : formatDiagnostics(results)) + '\n');
   if (!json && rt.auth?.refreshExpiresAt) {
@@ -299,7 +325,7 @@ export function readyCp(rt: Runtime, io: Io): rt is Runtime & Required<Pick<Runt
     io.err(
       rt.auth?.refreshToken
         ? 'the login could not be refreshed — is the control plane reachable? (`mocactl doctor`)'
-        : 'not logged in — run `mocactl login` first',
+        : 'not logged in — run `mocactl login` first' + mismatchClause(rt),
     );
     return false;
   }

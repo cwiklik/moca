@@ -293,6 +293,59 @@ describe('cmdRun', () => {
   });
 });
 
+// #529: auth.json holds a login, for another control plane. The gates used to say a flat "not
+// logged in", so the user logged in again and overwrote the one login -- the loop reported as "the
+// token only lasts an hour". Saying WHICH control plane is what breaks it.
+describe('a cached login for another control plane (#529)', () => {
+  function mismatched(): Runtime {
+    const rt = runtime({ auth: null, endpoints: { controlPlaneUrl: 'http://cp-b' } });
+    saveAuth(rt.paths, {
+      apiToken: 'a',
+      subject: 'github:1',
+      roles: [],
+      expiresAt: 4_000_000_000,
+      controlPlaneUrl: 'http://cp-a',
+    });
+    return rt;
+  }
+
+  it('readyCp names both URLs, and the exit code does not change', async () => {
+    const rt = mismatched();
+    const o = io();
+    expect(await cmdRun(rt, o, { prompt: 'hi', options: {}, json: false })).toBe(2);
+    const err = o.stderr.join('\n');
+    expect(err).toMatch(/not logged in/);
+    expect(err).toContain('http://cp-a');
+    expect(err).toContain('http://cp-b');
+  });
+
+  it('auth token names both URLs and still exits 3 for the hook', async () => {
+    const o = io();
+    expect(await cmdAuthToken(mismatched(), o, false)).toBe(3);
+    const err = o.stderr.join('\n');
+    expect(err).toContain('http://cp-a');
+    expect(err).toContain('http://cp-b');
+    expect(o.stdout).toBe('');
+  });
+
+  it('says only the plain thing when there is no cached login at all', async () => {
+    const o = io();
+    const rt = runtime({ auth: null, endpoints: { controlPlaneUrl: 'http://cp-b' } });
+    expect(await cmdRun(rt, o, { prompt: 'hi', options: {}, json: false })).toBe(2);
+    expect(o.stderr.join('\n')).toBe('not logged in — run `mocactl login` first');
+  });
+
+  it('doctor names the other control plane in check 3', async () => {
+    const o = io();
+    expect(await cmdDoctor(mismatched(), o, true)).toBe(1);
+    const login = (JSON.parse(o.stdout) as Array<{ id: number; fix?: string }>).find(
+      (r) => r.id === 3,
+    );
+    expect(login?.fix).toContain('http://cp-a');
+    expect(login?.fix).toContain('http://cp-b');
+  });
+});
+
 describe('cmdDoctor', () => {
   it('prints the checks and exits 0 when all pass', async () => {
     const o = io();

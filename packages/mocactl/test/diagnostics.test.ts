@@ -45,8 +45,23 @@ describe('runDiagnostics', () => {
   it('fails the login check without calling /v1/me when there is no cached login', async () => {
     const d = deps({ loggedIn: false });
     const results = await runDiagnostics(d);
-    expect(results.at(-1)).toMatchObject({ id: 3, status: 'fail' });
+    expect(results.at(-1)).toMatchObject({ id: 3, status: 'fail', detail: 'no cached login' });
+    expect(results.at(-1)?.fix).toBe(
+      'not logged in — run `mocactl login`, or start `mocactl` to log in',
+    );
     expect((d.cp as unknown as { calls: string[] }).calls).not.toContain('me');
+  });
+
+  // #529: there IS a login, for another control plane. Saying so is what stops the user logging in
+  // again and overwriting it -- the loop the issue was reported as.
+  it('names the other control plane when the cached login is not for this one (#529)', async () => {
+    const results = await runDiagnostics(deps({ loggedIn: false, storedLoginUrl: 'http://cp-a' }));
+    const login = results.at(-1);
+    expect(login).toMatchObject({ id: 3, status: 'fail' });
+    expect(login?.detail).toContain('http://cp-a');
+    expect(login?.detail).toContain('http://cp');
+    expect(login?.fix).toContain('http://cp-a');
+    expect(login?.fix).toContain('mocactl login');
   });
 
   it('fails check 4 when only non-inference credentials exist', async () => {

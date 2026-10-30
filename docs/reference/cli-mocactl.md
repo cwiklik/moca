@@ -38,6 +38,12 @@ With no harness URL, `mocactl` asks the control plane (`GET /v1/discovery`), whi
 `SH_PUBLIC_HARNESS_URL` its operator set. Every command that talks to the control plane exits 2 with
 `missing control-plane URL` if none is set.
 
+The cached login belongs to one control plane, and is matched by endpoint rather than by spelling:
+host case, an explicit `:80`/`:443` and a trailing slash all name the same control plane, so moving
+between the flag, the environment variable and `config.json` keeps you logged in. A different
+scheme, host, port or **path prefix** is a different control plane — its login is not used, and the
+message (and `mocactl doctor`) then names the control plane the login on this machine is for.
+
 ## Exit codes
 
 | Code  | Meaning                                                                          |
